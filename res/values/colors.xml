@@ -1,0 +1,8 @@
+<resources>
+    <color name="nemotron_icon_background">#0A051F</color>
+    <color name="nemotron_primary">#9CFF47</color>
+    <color name="nemotron_secondary">#39E6C5</color>
+    <color name="nemotron_accent">#00D4FF</color>
+    <color name="nemotron_surface">#12102A</color>
+    <color name="nemotron_text">#E8F5E9</color>
+</resources>

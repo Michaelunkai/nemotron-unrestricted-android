@@ -1,0 +1,42 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+RISH=/data/data/com.termux/files/home/.local/bin/rish
+
+usage() {
+  printf 'usage: codex-lan-discover --self|--neighbors|--scope <CIDR>\n'
+}
+
+case "${1:-}" in
+  -h|--help|'')
+    usage
+    exit 0
+    ;;
+  --self)
+    exec "$RISH" -c 'ip -brief address show wlan0; ip route'
+    ;;
+  --neighbors)
+    exec "$RISH" -c 'ip neigh show'
+    ;;
+  --scope)
+    [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+    normalized=$(python - "$2" <<'PY'
+import ipaddress
+import sys
+
+try:
+    network = ipaddress.ip_network(sys.argv[1], strict=False)
+except ValueError as error:
+    raise SystemExit(f"invalid CIDR: {error}")
+if network.num_addresses > 4096:
+    raise SystemExit("scope exceeds the 4096-address safety bound")
+print(network)
+PY
+    )
+    exec nmap -sn -n --max-retries 1 --host-timeout 5s "$normalized"
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

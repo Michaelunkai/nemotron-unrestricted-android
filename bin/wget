@@ -1,0 +1,15 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+REAL_WGET=/data/data/com.termux/files/usr/bin/wget
+parent_command=""
+if [ -r "/proc/$PPID/cmdline" ]; then
+  parent_command="$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || true)"
+fi
+
+if printf '%s\n' "$parent_command" | /data/data/com.termux/files/usr/bin/grep -Eiq 'wget[^|;&]*(\||&&|;)[[:space:]]*(env[[:space:]]+)?(ba|da|z)?sh([[:space:];]|$)|((ba|da|z)?sh)[^;]*(\$\(|<\()[^)]*wget'; then
+  printf '%s\n' 'Blocked unsafe network-to-shell execution. Use codex-search/codex-fetch/codex-download, verify provenance and checksum, then invoke a reviewed artifact explicitly.' >&2
+  exit 126
+fi
+
+exec "$REAL_WGET" "$@"

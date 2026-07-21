@@ -1,0 +1,61 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Verified uninstaller that refuses Nemotron, sibling, Shizuku, and system apps."""
+
+import json
+import shlex
+import sys
+
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    package_evidence,
+    package_is_protected,
+    run_rish,
+    sanitized_policy_message,
+    validate_package_id,
+)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in {"--help", "-h"}:
+        print("usage: codex-uninstall <android.package.id>")
+        return 0
+    if len(args) != 1:
+        print("usage: codex-uninstall <android.package.id>", file=sys.stderr)
+        return 2
+    try:
+        package = validate_package_id(args[0])
+        before = package_evidence(package)
+        if not before["installed"]:
+            print(json.dumps({"ok": False, "installed": False, "package": package, "error": "package_not_installed"}))
+            return 4
+        if package_is_protected(package):
+            raise AndroidPolicyError("protected_package_uninstall")
+        result = run_rish(f"pm uninstall --user 0 {shlex.quote(package)}", require_success=False)
+        after = package_evidence(package)
+        verified = result.remote_status == 0 and not after["installed"]
+        print(
+            json.dumps(
+                {
+                    "ok": verified,
+                    "package": package,
+                    "uninstalled": verified,
+                    "remoteStatus": result.remote_status,
+                    "verified": verified,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0 if verified else 5
+    except AndroidPolicyError as error:
+        print(sanitized_policy_message(error), file=sys.stderr)
+        return 77
+    except AndroidBridgeError as error:
+        print(json.dumps({"ok": False, "error": error.code, "verified": False}))
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

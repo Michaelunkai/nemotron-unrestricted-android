@@ -1,0 +1,169 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Use the existing global Windows credential broker from every Nemotron session."""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+from nemotron_powershell_policy import (
+    PolicyViolation,
+    prepare_gateway_payload,
+    sanitized_policy_message,
+    validate_powershell_gateway_tail,
+)
+
+
+GLOBAL_RUNTIME_ROOT = "/data/data/com.termux/files/home/.codex"
+GLOBAL_COMMAND = "/data/data/com.termux/files/home/.local/bin/codex-win"
+
+
+def usage():
+    print("usage: codex-win '<json-payload>' [--timeout seconds]")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help"}:
+        usage()
+        return 0
+    try:
+        validate_powershell_gateway_tail(args[1:])
+        requested_action = json.loads(args[0]).get("action")
+        gateway_payload = prepare_gateway_payload(args[0])
+    except (AttributeError, json.JSONDecodeError):
+        sys.stderr.write("PowerShell request blocked by local policy (gateway_payload_json).\n")
+        return 64
+    except PolicyViolation as error:
+        sys.stderr.write(sanitized_policy_message(error) + "\n")
+        return 64
+    env = dict(os.environ, CODEX_RUNTIME_ROOT=GLOBAL_RUNTIME_ROOT)
+    is_status = False
+    try:
+        is_status = json.loads(args[0]).get("action") == "status"
+    except (AttributeError, json.JSONDecodeError):
+        pass
+    command_args = [gateway_payload, *args[1:]]
+    if is_status and "--timeout" not in command_args:
+        command_args.extend(("--timeout", "5"))
+    gateway_timeout = 5 if is_status else 60
+    if "--timeout" in command_args:
+        gateway_timeout = int(command_args[command_args.index("--timeout") + 1])
+    process_timeout = gateway_timeout + 15
+    attempts = 3 if is_status else 1
+    last = None
+    timeout_error = None
+
+    def response_is_verified(process, response):
+        if not (
+            process.returncode == 0
+            and isinstance(response, dict)
+            and response.get("ok") is True
+            and response.get("exitCode") == 0
+        ):
+            return False
+        if response.get("verified") is True:
+            return True
+        if requested_action == "status":
+            policy = response.get("policy")
+            return bool(
+                response.get("companion") == "CODEX_PC_BRIDGE_READY"
+                and response.get("gateway") == "CODEX_WINDOWS_AUTONOMY_GATEWAY_READY"
+                and isinstance(response.get("computer"), str) and response["computer"]
+                and isinstance(response.get("user"), str) and response["user"]
+                and isinstance(response.get("elevated"), bool)
+                and isinstance(response.get("port"), int) and 1 <= response["port"] <= 65535
+                and isinstance(response.get("tailnetAddress"), str) and response["tailnetAddress"]
+                and isinstance(response.get("time"), str) and response["time"]
+                and isinstance(policy, dict)
+                and policy.get("interactiveApprovalRequired") is False
+                and isinstance(policy.get("readOnlyActions"), list)
+                and isinstance(policy.get("stateChangingActions"), list)
+            )
+        # The current Windows bridge marks generic PowerShell transport
+        # envelopes completed_unverified even when the bounded read-only
+        # GitHub probe emits its own machine-verifiable JSON receipt. Accept
+        # only that exact status action and only when the inner receipt is
+        # successful and explicitly verified. State-changing actions remain
+        # fail-closed on the outer gateway receipt.
+        if requested_action != "powershell_github_status":
+            return False
+        try:
+            receipt = json.loads(response.get("stdout", ""))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return bool(
+            isinstance(receipt, dict)
+            and receipt.get("ok") is True
+            and receipt.get("verified") is True
+            and isinstance(receipt.get("gitAvailable"), bool)
+            and isinstance(receipt.get("ghAvailable"), bool)
+            and isinstance(receipt.get("authenticated"), bool)
+        )
+
+    for attempt in range(attempts):
+        try:
+            last = subprocess.run(
+                [GLOBAL_COMMAND, *command_args],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=process_timeout,
+            )
+            timeout_error = None
+        except subprocess.TimeoutExpired:
+            timeout_error = (
+                "Paired Windows gateway did not answer before the bounded timeout; "
+                "the requested action was not reported as completed.\n"
+            )
+            last = None
+            if not is_status:
+                break
+            if attempt + 1 < attempts:
+                time.sleep(attempt + 1)
+            continue
+        if last.returncode == 0:
+            try:
+                response = json.loads(last.stdout)
+            except json.JSONDecodeError:
+                response = None
+            if response_is_verified(last, response):
+                break
+        if attempt + 1 < attempts:
+            time.sleep(attempt + 1)
+    if last is None:
+        if timeout_error:
+            sys.stderr.write(timeout_error)
+        return 1
+    try:
+        response = json.loads(last.stdout)
+    except json.JSONDecodeError:
+        response = None
+    verified = response_is_verified(last, response)
+    if not verified:
+        sys.stderr.write(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "windows_gateway_unverified",
+                    "processExitCode": last.returncode,
+                    "verified": False,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        return 5
+    if requested_action == "status" and response.get("verified") is not True:
+        response = dict(response)
+        response["upstreamVerified"] = False
+        response["verified"] = True
+        response["verificationBasis"] = "exact-status-receipt"
+    sys.stdout.write(json.dumps(response, separators=(",", ":"), sort_keys=True) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

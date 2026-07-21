@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "verificationRule": "command-v-help-or-version-then-safe-proof-and-independent-readback",
+  "capabilities": [
+    {"id":"web-research","commands":["codex-search","codex-fetch","curl"],"proof":"command -v codex-search codex-fetch curl","status":"installed"},
+    {"id":"browser-automation","commands":["codex-browser","codex-open-url"],"proof":"command -v codex-browser codex-open-url","status":"installed"},
+    {"id":"download-install","commands":["codex-download","codex-artifact","codex-install","codex-package"],"proof":"command -v codex-download codex-artifact codex-install codex-package","status":"installed"},
+    {"id":"android-ui-device","commands":["codex-android","codex-shizuku","codex-pm"],"proof":"codex-android capabilities","status":"installed"},
+    {"id":"android-media","commands":["codex-gallery"],"proof":"codex-gallery recent --kind image --hours 24 --limit 1 && codex-gallery faces --hours 24 --limit 1","status":"installed-local-face-presence-and-recoverable-trash"},
+    {"id":"multimodal-vision","commands":["codex-gallery","nemotron_unrestricted_proxy.py"],"proof":"python -m unittest tests.test_multimodal_frontend tests.test_gallery tests.test_nemotron_proxy","status":"installed-live-zero-price-catalog-dependent"},
+    {"id":"exact-dolphin-x1-405b","commands":["nemotron_unrestricted_proxy.py","windows/start-dolphin-x1-server.ps1"],"proof":"proxy /vault-health exactDolphinAvailable=true and paired PC /health status=ok","status":"installed-paired-pc-health-gated"},
+    {"id":"paired-windows-github","commands":["codex-win","codex-github"],"proof":"command -v codex-win codex-github","status":"installed-external-gateway-dependent"},
+    {"id":"durable-jobs-recovery","commands":["codex-job","codex-goal","codex-recover"],"proof":"command -v codex-job codex-goal codex-recover","status":"installed"},
+    {"id":"native-code-toolchains","commands":["python","node","java","javac","clang","gcc","go","rustc","cargo","cmake","make","git"],"proof":"command -v python node java javac clang gcc go rustc cargo cmake make git","status":"installed"},
+    {"id":"archives-files","commands":["tar","zip","7z","zstd","unzip"],"proof":"command -v tar zip 7z zstd unzip","status":"installed"},
+    {"id":"network-debug-static-analysis","commands":["nmap","openssl","gdb","strace","radare2","yara","apktool","aapt","apksigner","zipalign"],"proof":"command -v nmap openssl gdb strace radare2 yara apktool aapt apksigner zipalign","status":"installed-authorized-targets-only"}
+  ],
+  "unsupportedClaims": [
+    "captcha-bypass",
+    "credential-or-clipboard-theft",
+    "malware-evasion",
+    "reverse-shell-payloads",
+    "authorization-or-device-lock-bypass",
+    "stealth-persistence",
+    "unrooted-docker-in-docker-guarantee",
+    "unrooted-raw-packet-capture-or-injection",
+    "kernel-or-lsm-bypass"
+  ]
+}

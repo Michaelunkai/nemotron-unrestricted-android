@@ -1,0 +1,230 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Signer-pinned, in-place APK installer with independent installed readback."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.parse
+import uuid
+
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    PROTECTED_PACKAGES,
+    SELF_PACKAGE,
+    apk_signer,
+    package_evidence,
+    run_rish,
+    sanitized_policy_message,
+    validate_package_id,
+    validate_sha256,
+)
+
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+DOWNLOAD = pathlib.Path(__file__).with_name("codex-download")
+PACKAGE_LINE_RE = re.compile(
+    r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']*)'",
+    re.MULTILINE,
+)
+
+
+def parser():
+    result = argparse.ArgumentParser(
+        prog="codex-install",
+        usage=(
+            "codex-install <apk-or-url> [--package id] [--sha256 digest] "
+            "[--signer certificate-sha256] [--retries N] [--visible]"
+        ),
+    )
+    result.add_argument("target")
+    result.add_argument("--package")
+    result.add_argument("--sha256")
+    result.add_argument("--signer")
+    result.add_argument("--retries", type=int, default=3)
+    result.add_argument("--visible", action="store_true")
+    return result
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def inspect_apk(path):
+    try:
+        completed = subprocess.run(
+            ["aapt", "dump", "badging", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        raise AndroidPolicyError("apk_inspection_unavailable") from error
+    match = PACKAGE_LINE_RE.search(completed.stdout)
+    if completed.returncode != 0 or not match:
+        raise AndroidPolicyError("apk_identity_unavailable")
+    package, version_code, version_name = match.groups()
+    validate_package_id(package)
+    signer, signature_verified = apk_signer(str(path))
+    if not signature_verified or not signer:
+        raise AndroidPolicyError("apk_signature_invalid")
+    return {
+        "package": package,
+        "version": version_name,
+        "versionCode": int(version_code),
+        "sha256": file_sha256(path),
+        "signerSha256": signer,
+        "signatureVerified": True,
+        "bytes": path.stat().st_size,
+    }
+
+
+def acquire_url(url, expected_sha256, retries):
+    destination_dir = PROJECT_ROOT / "runtime" / ".codex" / "downloads" / "install"
+    destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination = destination_dir / ("install-" + uuid.uuid4().hex + ".apk")
+    command = [str(DOWNLOAD), url, "--output", str(destination), "--retries", str(retries)]
+    if expected_sha256:
+        command.extend(("--sha256", expected_sha256))
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=1800, check=False)
+        if completed.returncode != 0 or not destination.is_file():
+            raise AndroidPolicyError("url_acquisition_failed")
+        try:
+            receipt = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise AndroidPolicyError("url_acquisition_receipt") from error
+        if receipt.get("ok") is not True or receipt.get("verified") is not True:
+            raise AndroidPolicyError("url_acquisition_unverified")
+        if pathlib.Path(receipt.get("output", "")).resolve() != destination.resolve():
+            raise AndroidPolicyError("url_acquisition_output")
+        if receipt.get("sha256") != file_sha256(destination):
+            raise AndroidPolicyError("url_acquisition_checksum")
+        return destination
+    except Exception:
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def main():
+    args = parser().parse_args()
+    downloaded = None
+    try:
+        expected_sha256 = validate_sha256(args.sha256)
+        expected_signer = validate_sha256(args.signer)
+        if args.package:
+            expected_package = validate_package_id(args.package)
+        else:
+            expected_package = None
+        if not 1 <= args.retries <= 8:
+            raise AndroidPolicyError("retry_range")
+        parsed = urllib.parse.urlparse(args.target)
+        if parsed.scheme in {"http", "https"}:
+            if not expected_package:
+                raise AndroidPolicyError("url_package_required")
+            if not expected_signer:
+                raise AndroidPolicyError("url_signer_required")
+            downloaded = acquire_url(args.target, expected_sha256, args.retries)
+            target = downloaded
+        elif parsed.scheme == "file":
+            target = pathlib.Path(urllib.parse.unquote(parsed.path))
+        else:
+            target = pathlib.Path(args.target)
+        if not target.is_file() or target.is_symlink():
+            raise AndroidPolicyError("apk_local_file")
+        artifact = inspect_apk(target)
+        if expected_sha256 and artifact["sha256"] != expected_sha256:
+            raise AndroidPolicyError("apk_checksum_mismatch")
+        if expected_package and artifact["package"] != expected_package:
+            raise AndroidPolicyError("apk_package_mismatch")
+        if expected_signer and artifact["signerSha256"] != expected_signer:
+            raise AndroidPolicyError("apk_signer_mismatch")
+
+        package = artifact["package"]
+        before = package_evidence(package)
+        statically_protected = package in PROTECTED_PACKAGES or package.startswith("com.android.")
+        if statically_protected and package != SELF_PACKAGE:
+            raise AndroidPolicyError("protected_package_install")
+        if before.get("system") and package != SELF_PACKAGE:
+            raise AndroidPolicyError("system_package_install")
+        if package == SELF_PACKAGE:
+            if not expected_package or not expected_signer:
+                raise AndroidPolicyError("self_update_pin_required")
+            if before["installed"] and before.get("signerSha256") != artifact["signerSha256"]:
+                raise AndroidPolicyError("self_update_signer_changed")
+        elif before["installed"]:
+            if not before.get("verified") or before.get("signerSha256") != artifact["signerSha256"]:
+                raise AndroidPolicyError("installed_signer_mismatch")
+
+        result = run_rish(
+            f"pm install --user 0 -r -S {artifact['bytes']}",
+            timeout=300,
+            require_success=False,
+            input_path=target,
+        )
+        if result.remote_status != 0 or "Success" not in result.combined:
+            raise AndroidPolicyError("package_install_failed")
+        after = package_evidence(package)
+        verified = bool(
+            after.get("installed")
+            and after.get("verified")
+            and after.get("sha256") == artifact["sha256"]
+            and after.get("signerSha256") == artifact["signerSha256"]
+            and after.get("versionCode") == artifact["versionCode"]
+        )
+        if not verified:
+            raise AndroidPolicyError("installed_readback_mismatch")
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "installed": True,
+                    "package": package,
+                    "version": after.get("version"),
+                    "versionCode": after.get("versionCode"),
+                    "path": after.get("path"),
+                    "sha256": after.get("sha256"),
+                    "signerSha256": after.get("signerSha256"),
+                    "signatureVerified": after.get("signatureVerified"),
+                    "permissions": after.get("permissions", []),
+                    "sourceSha256": artifact["sha256"],
+                    "sourceSignerSha256": artifact["signerSha256"],
+                    "visibleFallbackRequested": bool(args.visible),
+                    "visibleFallbackUsed": False,
+                    "verified": True,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 0
+    except AndroidPolicyError as error:
+        print(sanitized_policy_message(error), file=sys.stderr)
+        return 77 if error.code.endswith(("required", "pin_required")) or "protected" in error.code else 5
+    except AndroidBridgeError as error:
+        print(json.dumps({"ok": False, "error": error.code, "verified": False}))
+        return 69
+    finally:
+        if downloaded is not None:
+            try:
+                downloaded.unlink()
+            except FileNotFoundError:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,277 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Project-local Android control with verified semantic actions and shared guards."""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    PROTECTED_PACKAGES,
+    list_packages,
+    package_evidence,
+    package_is_protected,
+    run_rish,
+    sanitized_policy_message,
+    validate_android_shell_command,
+    validate_package_id,
+)
+
+
+COMPONENT_RE = re.compile(r"\bu\d+\s+([^\s}]+/[^\s}]+)")
+RESOLVED_COMPONENT_RE = re.compile(r"^([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)$")
+
+
+def usage(stream=sys.stdout):
+    print(
+        "usage: codex-android capabilities|current|packages [fragment]|"
+        "open <package-or-fragment>|app-info <package>|ui <android-shell-command>|"
+        "tap|longtap|swipe|text|key|keyevent|screenshot|dump ...",
+        file=stream,
+    )
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def resumed_component():
+    result = run_rish("dumpsys activity activities")
+    text = result.combined
+    for pattern in (
+        r"topResumedActivity=.*?\bu\d+\s+([^\s}]+/[^\s}]+)",
+        r"mResumedActivity:.*?\bu\d+\s+([^\s}]+/[^\s}]+)",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    match = COMPONENT_RE.search(text)
+    return match.group(1) if match else None
+
+
+def visible_postcondition():
+    component = resumed_component()
+    return {
+        "component": component,
+        "package": component.split("/", 1)[0] if component else None,
+        "verified": bool(component),
+    }
+
+
+def require_arity(args, minimum, maximum=None):
+    maximum = minimum if maximum is None else maximum
+    if not minimum <= len(args) <= maximum:
+        usage(sys.stderr)
+        raise SystemExit(2)
+
+
+def integer(value, name, *, minimum=None, maximum=None):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise AndroidPolicyError(name + "_integer") from error
+    if minimum is not None and parsed < minimum:
+        raise AndroidPolicyError(name + "_range")
+    if maximum is not None and parsed > maximum:
+        raise AndroidPolicyError(name + "_range")
+    return parsed
+
+
+def handle_open(target):
+    matches = list_packages(target)
+    try:
+        exact = validate_package_id(target)
+    except AndroidPolicyError:
+        exact = None
+    if exact and exact in matches:
+        package = exact
+    elif len(matches) == 1:
+        package = matches[0]
+    else:
+        emit({"error": "package_not_unique", "matches": matches, "target": target, "verified": False})
+        return 4
+    resolved = run_rish(
+        f"cmd package resolve-activity --brief --user 0 {shlex.quote(package)}"
+    )
+    components = [
+        line.strip()
+        for line in resolved.combined.splitlines()
+        if RESOLVED_COMPONENT_RE.fullmatch(line.strip())
+    ]
+    if not components:
+        emit({"error": "launchable_activity_not_found", "package": package, "verified": False})
+        return 5
+    component = components[-1]
+    launched = run_rish(f"am start -W -n {shlex.quote(component)}", require_success=False)
+    verified = None
+    for _ in range(15):
+        verified = resumed_component()
+        if verified and verified.split("/", 1)[0] == package:
+            break
+        time.sleep(0.2)
+    ok = bool(launched.remote_status == 0 and verified and verified.split("/", 1)[0] == package)
+    emit(
+        {
+            "component": component,
+            "package": package,
+            "resumed": verified,
+            "remoteStatus": launched.remote_status,
+            "verified": ok,
+        }
+    )
+    return 0 if ok else 5
+
+
+def handle_input(action, args):
+    if action == "tap":
+        require_arity(args, 2)
+        x, y = (integer(value, "coordinate", minimum=0, maximum=100000) for value in args)
+        command = f"input tap {x} {y}"
+    elif action == "longtap":
+        require_arity(args, 2, 3)
+        x = integer(args[0], "coordinate", minimum=0, maximum=100000)
+        y = integer(args[1], "coordinate", minimum=0, maximum=100000)
+        duration = integer(args[2], "duration", minimum=100, maximum=60000) if len(args) == 3 else 800
+        command = f"input swipe {x} {y} {x} {y} {duration}"
+    elif action == "swipe":
+        require_arity(args, 4, 5)
+        values = [integer(value, "coordinate", minimum=0, maximum=100000) for value in args[:4]]
+        duration = integer(args[4], "duration", minimum=1, maximum=60000) if len(args) == 5 else 300
+        command = "input swipe %d %d %d %d %d" % (*values, duration)
+    elif action == "text":
+        require_arity(args, 1)
+        command = "input text " + shlex.quote(args[0])
+    else:
+        require_arity(args, 1)
+        key = integer(args[0], "keycode", minimum=0, maximum=10000)
+        command = f"input keyevent {key}"
+    result = run_rish(command, require_success=False)
+    postcondition = visible_postcondition()
+    postcondition.update({"action": action, "remoteStatus": result.remote_status})
+    postcondition["verified"] = result.remote_status == 0 and postcondition["verified"]
+    emit(postcondition)
+    return 0 if postcondition["verified"] else 5
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help"}:
+        usage()
+        return 0
+    action = args.pop(0)
+    try:
+        if action == "capabilities":
+            require_arity(args, 0)
+            emit(
+                {
+                    "actions": [
+                        "current", "packages", "open", "app-info", "ui", "shell",
+                        "tap", "longtap", "swipe", "text", "key", "keyevent",
+                        "screenshot", "dump", "settings", "force-stop", "url",
+                    ],
+                    "backend": "isolated-shizuku-rish",
+                    "launchVerification": "fresh-top-resumed-activity",
+                    "protectedPackages": sorted(PROTECTED_PACKAGES),
+                }
+            )
+            return 0
+        if action == "current":
+            require_arity(args, 0)
+            payload = visible_postcondition()
+            emit(payload)
+            return 0 if payload["verified"] else 5
+        if action == "packages":
+            require_arity(args, 0, 1)
+            packages = list_packages(args[0] if args else None)
+            emit({"ok": True, "count": len(packages), "packages": packages, "verified": True})
+            return 0
+        if action == "launch":
+            print("codex-android launch is unsupported; use codex-android open", file=sys.stderr)
+            return 2
+        if action == "open":
+            require_arity(args, 1)
+            return handle_open(args[0])
+        if action == "app-info":
+            require_arity(args, 1)
+            emit(package_evidence(args[0]))
+            return 0
+        if action in {"ui", "shell"}:
+            require_arity(args, 1, 1000)
+            command = args[0] if len(args) == 1 else shlex.join(args)
+            validate_android_shell_command(command)
+            result = run_rish(command, require_success=False)
+            if result.stdout:
+                sys.stdout.write(result.stdout + ("\n" if not result.stdout.endswith("\n") else ""))
+            if result.stderr:
+                sys.stderr.write(result.stderr + ("\n" if not result.stderr.endswith("\n") else ""))
+            return result.remote_status
+        if action in {"tap", "longtap", "swipe", "text", "key", "keyevent"}:
+            return handle_input(action, args)
+        if action == "force-stop":
+            require_arity(args, 1)
+            package = validate_package_id(args[0])
+            if package_is_protected(package):
+                raise AndroidPolicyError("protected_package_mutation")
+            command = f"am force-stop {shlex.quote(package)}"
+            stopped = run_rish(command)
+            absent = run_rish(
+                f"if pidof {shlex.quote(package)} >/dev/null 2>&1; then exit 5; else exit 0; fi",
+                require_success=False,
+            )
+            ok = stopped.remote_status == 0 and absent.remote_status == 0
+            emit({"package": package, "stopped": ok, "verified": ok})
+            return 0 if ok else 5
+        if action == "screenshot":
+            require_arity(args, 0, 1)
+            path = args[0] if args else "/sdcard/Download/nemotron-screenshot.png"
+            if not path.startswith(("/sdcard/Download/", "/storage/emulated/0/Download/")):
+                raise AndroidPolicyError("screenshot_path")
+            result = run_rish("screencap -p " + shlex.quote(path))
+            emit({"path": path, "captured": result.remote_status == 0, "verified": result.remote_status == 0})
+            return 0
+        if action == "dump":
+            require_arity(args, 0, 1)
+            path = args[0] if args else "/sdcard/Download/nemotron-window.xml"
+            if not path.startswith(("/sdcard/Download/", "/storage/emulated/0/Download/")):
+                raise AndroidPolicyError("dump_path")
+            result = run_rish("uiautomator dump " + shlex.quote(path))
+            emit({"path": path, "captured": result.remote_status == 0, "verified": result.remote_status == 0})
+            return 0
+        if action == "settings":
+            require_arity(args, 1, 1000)
+            command = "settings " + shlex.join(args)
+            result = run_rish(command, require_success=False)
+            if result.stdout:
+                print(result.stdout)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+            return result.remote_status
+        if action == "url":
+            require_arity(args, 1)
+            return subprocess.call([str(pathlib.Path(__file__).with_name("codex-open-url")), args[0]])
+        usage(sys.stderr)
+        return 2
+    except AndroidPolicyError as error:
+        print(sanitized_policy_message(error), file=sys.stderr)
+        return 77
+    except AndroidBridgeError as error:
+        emit(
+            {
+                "ok": False,
+                "error": error.code,
+                "remoteStatus": error.remote_status,
+                "verified": False,
+            }
+        )
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

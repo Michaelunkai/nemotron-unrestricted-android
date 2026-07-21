@@ -1,0 +1,77 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Guarded project-local Shizuku shell backed only by isolated rish assets."""
+
+import json
+import shlex
+import sys
+
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    run_rish,
+    sanitized_policy_message,
+    validate_android_shell_command,
+)
+
+
+def usage(stream=sys.stdout):
+    print("usage: codex-shizuku status|stage|test|shell <command>|<command>", file=stream)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in {"--help", "-h"}:
+        usage()
+        return 0
+    if not args:
+        usage(sys.stderr)
+        return 2
+    try:
+        if args[0] in {"status", "stage", "test"} and len(args) == 1:
+            result = run_rish("id; getenforce")
+            text = result.combined
+            ready = "uid=2000(shell)" in text and "Enforcing" in text
+            print(
+                json.dumps(
+                    {
+                        "ok": ready,
+                        "backend": "isolated-shizuku-rish",
+                        "shellUidVerified": "uid=2000(shell)" in text,
+                        "selinuxEnforcing": "Enforcing" in text,
+                        "remoteStatus": result.remote_status,
+                        "verified": ready,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return 0 if ready else 69
+        if args[0] == "shell":
+            args.pop(0)
+        if not args:
+            usage(sys.stderr)
+            return 2
+        command = args[0] if len(args) == 1 else shlex.join(args)
+        validate_android_shell_command(command)
+        result = run_rish(command, require_success=False)
+        if result.stdout:
+            sys.stdout.write(result.stdout + "\n")
+        if result.stderr:
+            sys.stderr.write(result.stderr + "\n")
+        return result.remote_status
+    except AndroidPolicyError as error:
+        print(sanitized_policy_message(error), file=sys.stderr)
+        return 77
+    except AndroidBridgeError as error:
+        print(
+            json.dumps(
+                {"ok": False, "error": error.code, "remoteStatus": error.remote_status, "verified": False},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

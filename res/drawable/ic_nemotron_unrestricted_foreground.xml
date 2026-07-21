@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep space background -->
+    <path android:fillColor="#0A051F" android:pathData="M54,8a46,46 0,1 0,0.01,0z" />
+    <!-- Outer neural ring -->
+    <path android:fillColor="#00000000" android:strokeColor="#9CFF47" android:strokeWidth="3" android:pathData="M54,14a40,40 0,1 0,0.01,0z" />
+    <!-- Neural pathways outer -->
+    <path android:fillColor="#00000000" android:strokeColor="#39E6C5" android:strokeWidth="1.5" android:strokeLineCap="round" android:pathData="M54,14C76,14 94,32 94,54S76,94 54,94S14,76 14,54S32,14 54,14z" />
+    <!-- Neural pathways inner -->
+    <path android:fillColor="#00000000" android:strokeColor="#00D4FF" android:strokeWidth="1.2" android:strokeLineCap="round" android:pathData="M54,22C67,22 78,33 78,46S67,70 54,70S30,59 30,46S41,22 54,22z" />
+    <!-- Central core - hexagon -->
+    <path android:fillColor="#0C1A2B" android:strokeColor="#9CFF47" android:strokeWidth="2" android:strokeLineJoin="round" android:pathData="M24,54C33,36 47,27 54,27C61,27 75,36 84,54C75,72 61,81 54,81C47,81 33,72 24,54z" />
+    <!-- Inner core -->
+    <path android:fillColor="#061018" android:strokeColor="#39E6C5" android:strokeWidth="1.5" android:pathData="M54,37a17,17 0,1 0,0.01,0z" />
+    <!-- Distinct Nemotron N core -->
+    <path android:fillColor="#00000000" android:strokeColor="#9CFF47" android:strokeWidth="5" android:strokeLineCap="round" android:strokeLineJoin="round" android:pathData="M43,66L43,42L65,66L65,42" />
+    <path android:fillColor="#39E6C5" android:pathData="M43,37a3,3 0,1 0,0.01,0zM65,37a3,3 0,1 0,0.01,0zM43,71a3,3 0,1 0,0.01,0zM65,71a3,3 0,1 0,0.01,0z" />
+    <!-- Circuit traces around core -->
+    <path android:fillColor="#00000000" android:strokeColor="#9CFF47" android:strokeWidth="1.8" android:strokeLineCap="round" android:pathData="M37,37L30,30M77,37L84,30M37,71L30,78M77,71L84,78" />
+    <!-- Data flow particles -->
+    <path android:fillColor="#00D4FF" android:pathData="M26,50a3,3 0,1 0,0.01,0zM82,50a3,3 0,1 0,0.01,0zM50,26a3,3 0,1 0,0.01,0zM50,78a3,3 0,1 0,0.01,0z" />
+    <!-- Unbroken chain links - representing unrestricted -->
+    <path android:fillColor="#00000000" android:strokeColor="#9CFF47" android:strokeWidth="2.5" android:strokeLineCap="round" android:pathData="M20,50a4,4 0,1 0,0.01,0zM88,50a4,4 0,1 0,0.01,0z" />
+    <path android:fillColor="#00000000" android:strokeColor="#39E6C5" android:strokeWidth="1.5" android:strokeLineCap="round" android:pathData="M18,48L14,44M86,48L90,44M18,52L14,56M86,52L90,56" />
+</vector>
