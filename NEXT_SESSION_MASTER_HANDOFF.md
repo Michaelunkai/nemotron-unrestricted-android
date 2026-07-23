@@ -780,21 +780,16 @@ The user explicitly authorized and the completed release published the full exac
 
 Verified publication evidence:
 
-- Secret-clean parentless release commit: `732060852f62fc1f5b2f164b9051b50755c0ee13`.
-- Exact release source tree: `6dfaff9d83dc8161620e5068b5c4383db225c469`.
-- Final secret-clean handoff-complete commit:
-  `c82a64812ec219d723de06774aadf9ca97f4d560`.
-- Final exact public tree:
-  `c973ed963a50d350b0df3881c8c8743b965d367d`.
-- Public `main`, `release/v1.4.0-clean`, and `v1.4.0` all independently resolved to the final commit above. GitHub’s commit API reported the final tree above, and the public raw handoff was byte-identical to the local completed checkpoint.
-- The earlier parentless release commit/tree remain useful provenance for the implementation before the final handoff-only documentation descendant; APK bytes did not change.
-- Executable file modes, README, changelog, release notes, research audit, capability contracts, tests, and `dist/Nemotron-Unrestricted-1.4.0.apk` are present in the public tree.
-- Release page: `https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.4.0`.
-- Direct APK: `https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.4.0/Nemotron-Unrestricted-1.4.0.apk`.
-- Release assets: `Nemotron-Unrestricted-1.4.0.apk` (292402 bytes), `Nemotron-Unrestricted-1.4.0.apk.sha256` (98 bytes), `Nemotron-Unrestricted-1.4.0.apk.release.json` (369 bytes), and `1.4.0-release-manifest.json` (686 bytes).
-- An independent headless public download placed the APK at `/sdcard/Download/Nemotron-Unrestricted-1.4.0.apk`; its SHA-256 read back as `4e3aa0c48e945221167ee8314c29813a31112b756a00e40b9b188804b5f9ac42`.
-- The downloaded public APK read back as package `com.michaelovsky.nemotronunrestricted.isolated`, versionName `1.4.0`, versionCode `5`, signer SHA-256 `f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f`, with v1/v2/v3 signatures verified.
-- The public raw release manifest SHA-256 matched the local file at `5715bc57d5b4426d912aaf8806211174ebbd4e87bda32413be37a9748d82e4e1`.
+- Secret-clean parentless implementation commit: `156aedc5f388a28aae832c6988814148f93f9439`.
+- Exact parentless implementation tree: `215e7130d70c0b064c58a6d7f4f88b76b3b0bcf2`.
+- Public `main`, `release/v1.6.0-clean`, and annotated tag `v1.6.0` resolve to the handoff-complete descendant of that parentless implementation commit. Resolve those refs live rather than trying to embed the final documentation commit’s own recursive identifier here.
+- Executable modes, README, changelog, this handoff, release notes/manifests, research audit, capability contracts, tests, deterministic icon sources/assets, trusted wrappers, and `dist/Nemotron-Unrestricted-1.6.0.apk` are present.
+- Release page: `https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.6.0`.
+- Direct APK: `https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.6.0/Nemotron-Unrestricted-1.6.0.apk`.
+- Release assets include `Nemotron-Unrestricted-1.6.0.apk` (292402 bytes), its `.sha256`, `.idsig`, `.release.json`, `1.6.0-release-manifest.json`, and a secret-clean source archive.
+- An independent headless public download verified SHA-256 `7d0b256ad3baa27247ded34879310ebfa09733df265d351abbf78416c422ac5d`.
+- The downloaded public APK read back as package `com.michaelovsky.nemotronunrestricted.isolated`, versionName `1.6.0`, versionCode `7`, signer SHA-256 `f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f`, with v1/v2/v3 signatures verified.
+- Public raw README, handoff, release notes, and machine-readable manifest were read back after publication; the raw handoff bytes matched this completed local file.
 - The public repository deliberately contains no credentials, signing keystore, signing properties, live runtime state, session data, or legacy local Git ancestry.
 - GitHub release immutability was not falsely claimed. Authenticity is established by the signed APK certificate, published SHA-256, exact public readback, and retained release metadata.
 
