@@ -74,6 +74,17 @@ class UiSafeTests(unittest.TestCase):
         self.assertEqual(len(suggestions), 1)
         self.assertEqual(suggestions[0]["text"], "Sign in")
 
+    def test_generic_view_class_does_not_outrank_visible_target_text(self):
+        root = MODULE["ET"].fromstring(
+            '<hierarchy>'
+            '<node text="" class="android.view.View" enabled="true" bounds="[0,0][10,10]" />'
+            '<node text="Connections" class="android.widget.TextView" enabled="true" bounds="[20,0][80,20]" />'
+            '</hierarchy>'
+        )
+        suggestions = MODULE["semantic_suggestions"](root, "open connections", 5)
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["text"], "Connections")
+
     def test_read_only_ui_inspection_retries_missing_remote_status(self):
         missing = MODULE["AndroidBridgeError"]("remote_status_missing")
         completed = Result("<hierarchy/>")

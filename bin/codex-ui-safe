@@ -139,7 +139,6 @@ def semantic_score(node, query):
         node.attrib.get("text", ""),
         node.attrib.get("content-desc", ""),
         node.attrib.get("resource-id", "").replace("_", " ").replace("-", " "),
-        node.attrib.get("class", "").rsplit(".", 1)[-1],
     )
     haystack = normalized(" ".join(fields))
     haystack_terms = set(haystack.split())
