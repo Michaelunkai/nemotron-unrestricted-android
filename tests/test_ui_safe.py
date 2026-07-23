@@ -98,7 +98,7 @@ class UiSafeTests(unittest.TestCase):
 
         def fake_rish(command, **_kwargs):
             calls.append(command)
-            if command == "dumpsys activity activities":
+            if command.startswith("dumpsys activity activities"):
                 return Result("topResumedActivity=ActivityRecord{} u0 com.example/.Main}")
             if command.startswith("uiautomator dump"):
                 match = MODULE["re"].search(r"cp\s+\S+\s+(\S+)\s+&&", command)

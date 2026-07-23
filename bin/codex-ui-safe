@@ -64,7 +64,10 @@ def read_rish(command, attempts=3):
 
 
 def current_package():
-    result = read_rish("dumpsys activity activities")
+    result = read_rish(
+        "dumpsys activity activities | "
+        "grep -m 1 -E 'topResumedActivity|mResumedActivity'"
+    )
     match = COMPONENT.search(result.combined)
     return match.group(1).split("/", 1)[0] if match else None
 
