@@ -319,9 +319,11 @@ Public repository:
 
 `https://github.com/Michaelunkai/nemotron-unrestricted-android`
 
-Public main commit:
+The v1.9 application source/release tag commit is:
 
 `88b94dc3d7cc08027bb61a279eca656b38d44150`
+
+Public `main` contains that release commit followed only by documentation-only updates to this authoritative handoff. Read the current main ref with `git ls-remote` instead of freezing a self-referential documentation commit SHA inside this file.
 
 Release/tag:
 
@@ -355,7 +357,7 @@ Publication was performed from a separately cloned public-main tree:
 
 `/data/data/com.termux/files/home/nemotron-public-v19-publish`
 
-That clean tree was based on public v1.8 commit `690572277b0299b382f500819c24d3af1d669557`, scanned 212 current files plus 3314 history files with no secret finding, scanned all 19 APK entries separately, committed only the v1.9 delta, and pushed commit `88b94dc...`.
+That clean tree was based on public v1.8 commit `690572277b0299b382f500819c24d3af1d669557`, scanned 212 current files plus 3314 history files with no secret finding, scanned all 19 APK entries separately, committed only the v1.9 delta as `88b94dc...`, then added this final handoff in documentation-only follow-up commits.
 
 The temporary unauthenticated read-only Git daemon used to transfer that exact clean commit to the authenticated paired PC was stopped. The PC clone remains at:
 
