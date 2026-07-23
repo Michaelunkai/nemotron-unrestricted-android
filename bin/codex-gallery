@@ -29,6 +29,8 @@ URIS = {
 FIELDS = ("_id", "_display_name", "relative_path", "date_added", "date_modified", "mime_type", "_size", "is_trashed")
 ROW_RE = re.compile(r"(?:^|\n)Row:\s+\d+\s+")
 KEY_RE = re.compile(r"(?:^|, )(_id|_display_name|relative_path|date_added|date_modified|mime_type|_size|is_trashed)=")
+GALLERY_RESULT_SCHEMA = "nemotron.gallery-result.v1"
+GALLERY_RENDER_TYPE = "verified-local-image-grid"
 
 
 def parser():
@@ -142,6 +144,63 @@ def safe_media_path(record):
 
 def progress(message):
     print(f"Gallery progress: {message}", file=sys.stderr, flush=True)
+
+
+def gallery_render_receipt(items, presentations, *, label):
+    images = []
+    for item in items:
+        path = str(item.get("path") or "")
+        media_id = item.get("_id")
+        mime_type = str(item.get("mime_type") or "")
+        if (
+            not path.startswith("/storage/emulated/0/")
+            or not isinstance(media_id, int)
+            or media_id < 1
+            or not mime_type.startswith("image/")
+        ):
+            continue
+        receipt = {
+            "path": path,
+            "mediaId": media_id,
+            "label": str(item.get("_display_name") or f"Gallery image {media_id}")[:240],
+            "mimeType": mime_type,
+            "verified": True,
+        }
+        size = item.get("_size")
+        if isinstance(size, int) and size >= 0:
+            receipt["bytes"] = size
+        images.append(receipt)
+    overview_images = [
+        {
+            "path": str(sheet["path"]),
+            "sha256": str(sheet["sha256"]),
+            "bytes": int(sheet["bytes"]),
+            "itemCount": int(sheet["itemCount"]),
+            "page": int(sheet["page"]),
+            "verified": True,
+        }
+        for sheet in presentations
+        if (
+            isinstance(sheet, dict)
+            and sheet.get("verified") is True
+            and isinstance(sheet.get("path"), str)
+            and isinstance(sheet.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", sheet["sha256"])
+            and isinstance(sheet.get("bytes"), int)
+            and sheet["bytes"] > 0
+            and isinstance(sheet.get("itemCount"), int)
+            and sheet["itemCount"] > 0
+            and isinstance(sheet.get("page"), int)
+            and sheet["page"] > 0
+        )
+    ]
+    return {
+        "type": GALLERY_RENDER_TYPE,
+        "label": label,
+        "images": images,
+        "overviewImages": overview_images,
+        "verified": len(images) == len(items),
+    }
 
 
 def presentation_sheets(items, label):
@@ -305,20 +364,31 @@ def face_inventory(args):
         {"path": path, "error": str(result.get("error"))}
         for path, result in by_path.items() if result.get("error")
     ]
+    render = gallery_render_receipt(items, presentations, label="Gallery images containing visible faces")
+    result_verified = (
+        len(by_path) == len(set(paths))
+        and all(path in by_path for path in paths)
+        and not detector_errors
+        and render["verified"]
+    )
     return {
+        "schema": GALLERY_RESULT_SCHEMA,
         "ok": True, "count": len(items), "scanned": len(candidates), "items": items,
         "totalCandidates": total_candidates, "offset": offset, "hasMore": has_more,
         "nextOffset": consumed if has_more else None, "presentations": presentations,
-        "verified": (
-            len(by_path) == len(set(paths))
-            and all(path in by_path for path in paths)
-            and not detector_errors
-        ),
+        "verified": result_verified, "render": render,
         "detectorReceiptCount": len(by_path),
         "detectorErrors": detector_errors,
         "uniquePathCount": len(set(paths)),
         "scope": "face-presence-only-no-identity-or-gender-inference",
-        "renderInstruction": "Render every presentations[].path inline, then continue nextOffset while hasMore is true.",
+        "displayMessage": (
+            f"Found {len(items)} image(s) containing visible faces in this page after scanning "
+            f"{len(candidates)} image(s). The verified images are displayed below."
+        ),
+        "renderInstruction": (
+            "Render every verified render.images[] item inline automatically in the app. "
+            "Continue nextOffset while hasMore is true."
+        ),
     }
 
 
@@ -490,13 +560,23 @@ def semantic_inventory(args):
     consumed = offset + len(candidates)
     has_more = consumed < total_candidates
     progress(f"found {len(items)} matching images and created {len(presentations)} presentation sheet(s).")
+    render = gallery_render_receipt(items, presentations, label=f'Gallery images matching “{query}”')
+    result_verified = not errors and render["verified"]
     return {
+        "schema": GALLERY_RESULT_SCHEMA,
         "ok": not errors, "count": len(items), "scanned": len(candidates), "items": items,
-        "errors": errors, "verified": not errors, "totalCandidates": total_candidates,
+        "errors": errors, "verified": result_verified, "totalCandidates": total_candidates,
         "offset": offset, "hasMore": has_more, "nextOffset": consumed if has_more else None,
-        "presentations": presentations,
+        "presentations": presentations, "render": render,
         "scope": "visible-content-search-no-identity-or-sensitive-attribute-inference",
-        "renderInstruction": "Render every presentations[].path inline, then continue nextOffset while hasMore is true.",
+        "displayMessage": (
+            f"Found {len(items)} image(s) matching the requested visible details in this page after "
+            f"comparing {len(candidates)} image(s). The verified images are displayed below."
+        ),
+        "renderInstruction": (
+            "Render every verified render.images[] item inline automatically in the app. "
+            "Continue nextOffset while hasMore is true."
+        ),
     }
 
 

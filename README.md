@@ -1,17 +1,17 @@
 # Nemotron Unrestricted for Android
 
-The current release is v1.6.0/code 7 at `dist/Nemotron-Unrestricted-1.6.0.apk`, SHA-256 `7d0b256ad3baa27247ded34879310ebfa09733df265d351abbf78416c422ac5d`. It preserves the completed UI/runtime recovery, one-click session/thread cleanup, and zero-floating-control UI while adding immediate stop-and-switch model selection, resilient full-gallery presentation, restricted-route network diagnostics, deterministic APK builds, and ordinary-English progress for every selectable model.
+The current release is v1.7.0/code 8 at `dist/Nemotron-Unrestricted-1.7.0.apk`, SHA-256 `aee351cc5cfd2735dd5bb16cbdd0ce51244e88d54bb5149b91420e5838634a90`. It preserves the completed UI/runtime recovery, model switching, background watchdog, completion sound, PC/network routes, and ordinary-English progress while adding model-independent automatic rendering of verified Android gallery results as visible, full-size-capable images in the same conversation.
 
-Release acceptance passed 353 automated tests, source validation, off-device 945×2048 UI goldens, the progress harness, source and signed-APK secret scans, two byte-identical builds, package/version/signature checks, a streamed install-session update, exact installed-byte readback, post-update session/project preservation, live gallery/contact-sheet and network/PC proofs, a three-second terminal-tone acknowledgement, and a real private-virtual-display WebView proof. The installed app was not launched or foregrounded during verification.
+Release acceptance passed 354 path-independent automated tests, source validation, four off-device 945×2048 UI goldens, the progress and executable gallery-frontend harnesses, source and signed-APK secret scans, two byte-identical builds, package/version/signature checks, a streamed install-session update, exact installed-byte readback, post-update session/project preservation, a live two-image MediaStore delivery proof with a checksum-verified contact sheet, and a fresh private-virtual-display WebView proof with zero console errors. The installed app was not physically foregrounded during verification.
 
 Nemotron Unrestricted is an independent Android launcher and Termux-hosted agent workspace for OpenRouter models. The local proxy adds no prompt/response content classifier; it provides OpenAI-compatible routing, bounded retries, tool-schema repair, and metadata-only auditing. Provider behavior, account access, Android permissions, target authorization, and hardware limits still apply.
 
 ## Download the Android APK
 
-The public source repository is [Michaelunkai/nemotron-unrestricted-android](https://github.com/Michaelunkai/nemotron-unrestricted-android). The universal Android 1.6.0 APK is available from the [v1.6.0 release](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.6.0):
+The public source repository is [Michaelunkai/nemotron-unrestricted-android](https://github.com/Michaelunkai/nemotron-unrestricted-android). The universal Android 1.7.0 APK is available from the [v1.7.0 release](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.7.0):
 
-- [Download Nemotron-Unrestricted-1.6.0.apk](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.6.0/Nemotron-Unrestricted-1.6.0.apk)
-- SHA-256: `7d0b256ad3baa27247ded34879310ebfa09733df265d351abbf78416c422ac5d`
+- [Download Nemotron-Unrestricted-1.7.0.apk](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.7.0/Nemotron-Unrestricted-1.7.0.apk)
+- SHA-256: `aee351cc5cfd2735dd5bb16cbdd0ce51244e88d54bb5149b91420e5838634a90`
 - Signing certificate SHA-256: `f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f`
 
 Android users can download and install the APK on compatible devices after allowing installation from their chosen browser/file manager. The APK is the launcher and lifecycle manager; full agent operation also requires the Termux-hosted repository/runtime, local credentials, permissions, and—only for exact Dolphin X1—the paired-PC setup described below. Installing the APK alone does not bundle an 85 GB model or bypass Android/provider requirements.
@@ -20,7 +20,7 @@ Android users can download and install the APK on compatible devices after allow
 
 - Android package: `com.michaelovsky.nemotronunrestricted.isolated`
 - Activity: `.MainActivity`
-- Version: 1.6.0 (`versionCode 7`)
+- Version: 1.7.0 (`versionCode 8`)
 - GUI: first free loopback port from 5903
 - Proxy: first free loopback port from 18774
 - Supervisor: first free loopback port from 18775
@@ -47,7 +47,8 @@ Tool-bearing requests continue to use a current zero-price catalog model that ex
 - Durable metadata-only active/progress/completion ledgers with event deduplication, restart-safe global and per-turn sequencing, filtered readback, and rejection of foreign, regressing, late, or raw-command progress.
 - Guarded Android package controls that refuse destructive actions against the original Codex app, Codex Frontier, the NVIDIA app, Termux, Shizuku, and Android system packages.
 - Project-local Android, web, confined download, signer-pinned APK, Wi-Fi, LAN, and authorized diagnostic workflows. See `capabilities/CAPABILITY_CATALOG.md` for the exact command surface.
-- Resumable gallery face-presence and non-sensitive visible-content scans with eight-image batches, omitted-receipt retries, offsets, verified contact sheets, and an inline-render continuation contract.
+- Resumable gallery face-presence and non-sensitive visible-content scans with eight-image batches, omitted-receipt retries, exact offsets, versioned MediaStore-bound receipts, verified contact sheets, automatic same-session lazy previews, and tap-to-open full-size viewing. “All/every” requests continue until `hasMore:false`.
+- Structured generated-image outputs remain persisted and rendered through the native `imageView` path; a prose claim, filename alone, or inaccessible image URL is never treated as successful image output.
 - Android route verification that falls back from restricted kernel routes to sanitized ConnectivityService metadata and a no-payload kernel socket route probe.
 - Fail-closed read-only Windows PowerShell routing, a separate direct Git/GitHub route, and a structured receipt-backed cleanup workflow; caller-authored deletion and encoded/dynamic/nested shell invocation are rejected before the paired gateway.
 - One shared SHA-256-identified capability contract for every selectable model, with tool-only continuation routing that preserves the transcript, instructions, attachments, approvals, plan, and factual English progress.
@@ -121,7 +122,7 @@ Install without uninstalling or clearing data. Pin the certificate already insta
 
 ```bash
 EXPECTED_SIGNER_SHA256="$(codex-package inspect com.michaelovsky.nemotronunrestricted.isolated | jq -r .signerSha256)"
-codex-install dist/Nemotron-Unrestricted-1.6.0.apk \
+codex-install dist/Nemotron-Unrestricted-1.7.0.apk \
   --package com.michaelovsky.nemotronunrestricted.isolated \
   --signer "$EXPECTED_SIGNER_SHA256" \
   --sha256 "7d0b256ad3baa27247ded34879310ebfa09733df265d351abbf78416c422ac5d"

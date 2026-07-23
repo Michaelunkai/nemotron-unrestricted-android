@@ -69,4 +69,5 @@ printf 'NEMOTRON_JS_SYNTAX_OK files=%s\n' "$js_count"
 "$PYTHON_BIN" "$APP_HOME/tools/patch-codexapp-ui.py" --check
 "$PYTHON_BIN" "$APP_HOME/tools/render-offdevice-ui.py" --check
 "$NODE_BIN" "$APP_HOME/tests/progress_overlay_harness.js"
+"$NODE_BIN" "$APP_HOME/tests/gallery_frontend_harness.js"
 printf 'NEMOTRON_SOURCE_VALIDATION_OK\n'

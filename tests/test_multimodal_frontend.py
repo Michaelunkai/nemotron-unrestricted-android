@@ -27,6 +27,13 @@ class MultimodalFrontendTests(unittest.TestCase):
         self.assertIn('alt:t.messageType==="imageView"?"Generated image":"Message image preview"', self.scripts)
         self.assertIn('message-generated-image-preview', self.scripts)
 
+    def test_verified_gallery_results_render_without_model_markdown(self):
+        self.assertIn("function nemotronGalleryResult", self.scripts)
+        self.assertIn("nemotron.gallery-result.v1", self.scripts)
+        self.assertIn("verified-local-image-grid", self.scripts)
+        self.assertIn("nemotron-gallery-image-list", self.scripts)
+        self.assertIn("nemotronGalleryResult(e)!==null", self.scripts)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -140,6 +140,38 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(len(receipts), len(set(paths)))
         self.assertTrue(all(path in receipts for path in paths))
 
+    def test_gallery_render_receipt_is_versioned_and_media_bound(self):
+        receipt = GALLERY.gallery_render_receipt(
+            [{
+                "_id": 42,
+                "_display_name": "person.jpg",
+                "_size": 12345,
+                "mime_type": "image/jpeg",
+                "path": "/storage/emulated/0/DCIM/Camera/person.jpg",
+            }],
+            [],
+            label="Visible face matches",
+        )
+        self.assertEqual(receipt["type"], GALLERY.GALLERY_RENDER_TYPE)
+        self.assertTrue(receipt["verified"])
+        self.assertEqual(receipt["images"][0]["mediaId"], 42)
+        self.assertEqual(receipt["images"][0]["bytes"], 12345)
+        self.assertEqual(receipt["images"][0]["mimeType"], "image/jpeg")
+
+    def test_gallery_render_receipt_rejects_non_media_paths(self):
+        receipt = GALLERY.gallery_render_receipt(
+            [{
+                "_id": 42,
+                "_display_name": "private.jpg",
+                "mime_type": "image/jpeg",
+                "path": "/data/data/com.example/private.jpg",
+            }],
+            [],
+            label="Invalid fixture",
+        )
+        self.assertFalse(receipt["verified"])
+        self.assertEqual(receipt["images"], [])
+
     def test_presentation_sheets_render_every_item_with_hashes(self):
         temporary = pathlib.Path(tempfile.mkdtemp(prefix="gallery-present-", dir=ROOT / "workspace"))
         generated_parent = ROOT / "workspace/gallery-presentations"

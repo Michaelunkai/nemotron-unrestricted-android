@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.0 — 2026-07-23
+
+- Automatically render every verified gallery match inline in the same conversation, independent of model Markdown behavior.
+- Add versioned MediaStore-bound gallery receipts, strict frontend validation, automatic command expansion, lazy full-size previews, and tap-to-open viewing.
+- Require every selectable model to continue paginated all/every gallery requests until hasMore is false while preserving face-presence and sensitive-attribute safeguards.
+- Preserve native structured generated-image rendering and add executable regression coverage for malformed, failed, private-path, pagination, and screenshot-equivalent cases.
+
 ## 1.5.0 — 2026-07-23
 
 - Added resumable full-gallery face-presence and non-sensitive semantic scans with exact English batch progress, continuation receipts, and checksum-verified inline presentation sheets.

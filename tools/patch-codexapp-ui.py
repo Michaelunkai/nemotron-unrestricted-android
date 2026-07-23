@@ -150,9 +150,109 @@ BASE_THREAD_STATUS_SPAN = 'd("span",$i,h(Zn(t)),1)'
 PATCHED_THREAD_STATUS_SPAN = (
     'd("span",{...$i,role:"status","aria-live":"polite","aria-atomic":"true"},h(Zn(t)),1)'
 )
+BASE_THREAD_COMMAND_TYPE = (
+    'function O(e){return e.messageType==="commandExecution"&&!!e.commandExecution}'
+)
+PATCHED_THREAD_COMMAND_TYPE = (
+    'function nemotronGalleryResult(e){const n=e&&e.commandExecution,'
+    't=(n==null?void 0:n.command)||"",i=(n==null?void 0:n.aggregatedOutput)||"";'
+    'if(!n||n.status!=="completed"||n.exitCode!==0||'
+    '!/(?:^|\\s)(?:\\/[^\\s]+\\/)?codex-gallery\\s+(?:faces|semantic)(?:\\s|$)/u.test(t))'
+    'return null;let s=null;for(const a of i.trim().split(/\\r?\\n/u).reverse()){'
+    'const c=a.trim();if(!c.startsWith("{")||!c.endsWith("}"))continue;'
+    'try{s=JSON.parse(c);break}catch{}}'
+    'if(!s||s.schema!=="nemotron.gallery-result.v1"||s.verified!==!0||'
+    '!s.render||s.render.type!=="verified-local-image-grid"||s.render.verified!==!0||'
+    '!Array.isArray(s.render.images)||s.render.images.length>250)return null;'
+    'const a=[];for(const c of s.render.images){const o=c&&c.path,u=c&&c.mimeType;'
+    'if(!c||c.verified!==!0||!Number.isSafeInteger(c.mediaId)||c.mediaId<1||'
+    'typeof o!=="string"||!o.startsWith("/storage/emulated/0/")||o.includes("\\0")||'
+    'typeof u!=="string"||!/^image\\/(?:avif|bmp|gif|jpeg|png|webp)$/u.test(u))return null;'
+    'a.push({url:`/codex-local-image?path=${encodeURIComponent(o)}`,'
+    'label:typeof c.label==="string"&&c.label.trim()?c.label.trim():"Verified gallery image"});}'
+    'return{images:a,message:typeof s.displayMessage==="string"&&s.displayMessage.trim()?'
+    's.displayMessage.trim():`Found ${a.length} verified gallery image(s).`,'
+    'hasMore:s.hasMore===!0,nextOffset:Number.isSafeInteger(s.nextOffset)?s.nextOffset:null}}'
+    'function O(e){return e.messageType==="commandExecution"&&!!e.commandExecution}'
+)
+BASE_THREAD_COMMAND_EXPANSION = (
+    'function R(e){return O(e)?he.value.has(e.id)||!j.value.has(e.id)&&Rt(e):!1}'
+)
+PATCHED_THREAD_COMMAND_EXPANSION = (
+    'function R(e){return O(e)?nemotronGalleryResult(e)!==null||he.value.has(e.id)||'
+    '!j.value.has(e.id)&&Rt(e):!1}'
+)
+BASE_GROUPED_COMMAND_OUTPUT = (
+    'd("div",Si,[d("pre",{class:C(["cmd-output",{"cmd-output-condensed":lt(o)}]),'
+    'textContent:h(((f=o.commandExecution)==null?void 0:f.aggregatedOutput)||"(no output)")},'
+    'null,10,Ai)])'
+)
+PATCHED_GROUPED_COMMAND_OUTPUT = (
+    'd("div",Si,[d("pre",{class:C(["cmd-output",{"cmd-output-condensed":lt(o)}]),'
+    'textContent:h(((f=o.commandExecution)==null?void 0:f.aggregatedOutput)||"(no output)")},'
+    'null,10,Ai),nemotronGalleryResult(o)?(r(),l("section",{key:0,class:"nemotron-gallery-result",'
+    '"data-gallery-schema":"nemotron.gallery-result.v1"},['
+    'd("p",{class:"nemotron-gallery-status",role:"status","aria-live":"polite"},'
+    'h(nemotronGalleryResult(o).message),1),d("ul",{class:"message-image-list '
+    'message-generated-image-list nemotron-gallery-image-list"},[(r(!0),l(_,null,b(nemotronGalleryResult(o).images,m=>'
+    '(r(),l("li",{key:m.url,class:"message-image-item"},[d("button",{class:'
+    '"message-image-button",type:"button",title:m.label,onClick:k=>An(m.url)},'
+    '[d("img",{class:"message-image-preview message-generated-image-preview",src:m.url,alt:m.label,loading:"lazy"},'
+    'null,8,oo)],8,io)]))),128))]),nemotronGalleryResult(o).hasMore?'
+    '(r(),l("p",{key:0,class:"nemotron-gallery-continuation"},'
+    'h(`More gallery images remain. The next verified scan starts at offset '
+    '${nemotronGalleryResult(o).nextOffset}.`),1)):y("",!0)])):y("",!0)])'
+)
+BASE_SINGLE_COMMAND_OUTPUT = (
+    'd("div",Oi,[d("pre",{class:C(["cmd-output",{"cmd-output-condensed":lt(t)}]),'
+    'textContent:h(((s=t.commandExecution)==null?void 0:s.aggregatedOutput)||"(no output)")},'
+    'null,10,Ri)])'
+)
+PATCHED_SINGLE_COMMAND_OUTPUT = (
+    'd("div",Oi,[d("pre",{class:C(["cmd-output",{"cmd-output-condensed":lt(t)}]),'
+    'textContent:h(((s=t.commandExecution)==null?void 0:s.aggregatedOutput)||"(no output)")},'
+    'null,10,Ri),nemotronGalleryResult(t)?(r(),l("section",{key:0,class:"nemotron-gallery-result",'
+    '"data-gallery-schema":"nemotron.gallery-result.v1"},['
+    'd("p",{class:"nemotron-gallery-status",role:"status","aria-live":"polite"},'
+    'h(nemotronGalleryResult(t).message),1),d("ul",{class:"message-image-list '
+    'message-generated-image-list nemotron-gallery-image-list"},[(r(!0),l(_,null,b(nemotronGalleryResult(t).images,o=>'
+    '(r(),l("li",{key:o.url,class:"message-image-item"},[d("button",{class:'
+    '"message-image-button",type:"button",title:o.label,onClick:u=>An(o.url)},'
+    '[d("img",{class:"message-image-preview message-generated-image-preview",src:o.url,alt:o.label,loading:"lazy"},'
+    'null,8,oo)],8,io)]))),128))]),nemotronGalleryResult(t).hasMore?'
+    '(r(),l("p",{key:0,class:"nemotron-gallery-continuation"},'
+    'h(`More gallery images remain. The next verified scan starts at offset '
+    '${nemotronGalleryResult(t).nextOffset}.`),1)):y("",!0)])):y("",!0)])'
+)
+BASE_WORKED_COMMAND_OUTPUT = (
+    'd("div",bo,[d("pre",{class:C(["cmd-output",{"cmd-output-condensed":lt(o)}]),'
+    'textContent:h(((f=o.commandExecution)==null?void 0:f.aggregatedOutput)||"(no output)")},'
+    'null,10,xo)])'
+)
+PATCHED_WORKED_COMMAND_OUTPUT = (
+    'd("div",bo,[d("pre",{class:C(["cmd-output",{"cmd-output-condensed":lt(o)}]),'
+    'textContent:h(((f=o.commandExecution)==null?void 0:f.aggregatedOutput)||"(no output)")},'
+    'null,10,xo),nemotronGalleryResult(o)?(r(),l("section",{key:0,class:"nemotron-gallery-result",'
+    '"data-gallery-schema":"nemotron.gallery-result.v1"},['
+    'd("p",{class:"nemotron-gallery-status",role:"status","aria-live":"polite"},'
+    'h(nemotronGalleryResult(o).message),1),d("ul",{class:"message-image-list '
+    'message-generated-image-list nemotron-gallery-image-list"},[(r(!0),l(_,null,b(nemotronGalleryResult(o).images,m=>'
+    '(r(),l("li",{key:m.url,class:"message-image-item"},[d("button",{class:'
+    '"message-image-button",type:"button",title:m.label,onClick:k=>An(m.url)},'
+    '[d("img",{class:"message-image-preview message-generated-image-preview",src:m.url,alt:m.label,loading:"lazy"},'
+    'null,8,oo)],8,io)]))),128))]),nemotronGalleryResult(o).hasMore?'
+    '(r(),l("p",{key:0,class:"nemotron-gallery-continuation"},'
+    'h(`More gallery images remain. The next verified scan starts at offset '
+    '${nemotronGalleryResult(o).nextOffset}.`),1)):y("",!0)])):y("",!0)])'
+)
 THREAD_PATCHES = (
     ("English grouped command summary", BASE_THREAD_COMMAND_SUMMARY, PATCHED_THREAD_COMMAND_SUMMARY),
     ("accessible grouped command live status", BASE_THREAD_STATUS_SPAN, PATCHED_THREAD_STATUS_SPAN),
+    ("verified gallery result parser", BASE_THREAD_COMMAND_TYPE, PATCHED_THREAD_COMMAND_TYPE),
+    ("automatic verified gallery expansion", BASE_THREAD_COMMAND_EXPANSION, PATCHED_THREAD_COMMAND_EXPANSION),
+    ("verified grouped gallery images", BASE_GROUPED_COMMAND_OUTPUT, PATCHED_GROUPED_COMMAND_OUTPUT),
+    ("verified single gallery images", BASE_SINGLE_COMMAND_OUTPUT, PATCHED_SINGLE_COMMAND_OUTPUT),
+    ("verified worked gallery images", BASE_WORKED_COMMAND_OUTPUT, PATCHED_WORKED_COMMAND_OUTPUT),
 )
 
 PATCHES = (
@@ -197,6 +297,42 @@ def main():
     thread_source = THREAD_ASSET.read_text(encoding="utf-8")
     thread_updated = thread_source
     applied = []
+    legacy_gallery_parser = PATCHED_THREAD_COMMAND_TYPE.replace(
+        '!/(?:^|\\s)(?:\\/[^\\s]+\\/)?codex-gallery',
+        '!/(?:^|[\\s"\\\'])(?:\\/[^\\s"\\\']+\\/)?codex-gallery',
+        1,
+    )
+    if legacy_gallery_parser in thread_updated and PATCHED_THREAD_COMMAND_TYPE not in thread_updated:
+        thread_updated = thread_updated.replace(
+            legacy_gallery_parser, PATCHED_THREAD_COMMAND_TYPE, 1,
+        )
+        applied.append("repair gallery command matcher")
+    legacy_gallery_list = 'class:"message-image-list nemotron-gallery-image-list"'
+    current_gallery_list = (
+        'class:"message-image-list message-generated-image-list nemotron-gallery-image-list"'
+    )
+    legacy_gallery_preview = 'class:"message-image-preview",src:'
+    current_gallery_preview = (
+        'class:"message-image-preview message-generated-image-preview",src:'
+    )
+    if legacy_gallery_list in thread_updated and current_gallery_list not in thread_updated:
+        if thread_updated.count(legacy_gallery_list) != 3:
+            raise SystemExit("Refusing ambiguous gallery list size migration")
+        thread_updated = thread_updated.replace(legacy_gallery_list, current_gallery_list)
+        applied.append("full-size gallery lists")
+    gallery_preview_count = sum(
+        thread_updated.count(f'{legacy_gallery_preview}{name}.url')
+        for name in ("m", "o")
+    )
+    if gallery_preview_count and current_gallery_preview not in thread_updated:
+        if gallery_preview_count != 3:
+            raise SystemExit("Refusing ambiguous gallery preview size migration")
+        for name in ("m", "o"):
+            thread_updated = thread_updated.replace(
+                f'{legacy_gallery_preview}{name}.url',
+                f'{current_gallery_preview}{name}.url',
+            )
+        applied.append("full-size gallery previews")
     for previous, migration_label in (
         (LEGACY_CLEANUP_HANDLER, "cleanup convergence race hardening"),
         (BUGGY_STRICT_CLEANUP_HANDLER, "cleanup convergence strict declaration"),
