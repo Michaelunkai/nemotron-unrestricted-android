@@ -1,0 +1,205 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Throttled provenance-preserving web search and fetch wrapper."""
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.parse
+
+from nemotron_automation import AutomationState, safe_mode_status
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SEARCH = os.environ.get("NEMOTRON_SEARCH_COMMAND", "/data/data/com.termux/files/home/.local/bin/codex-search")
+FETCH = os.environ.get("NEMOTRON_FETCH_COMMAND", "/data/data/com.termux/files/home/.local/bin/codex-fetch")
+MIN_DOMAIN_DELAY = 1.0
+
+
+class ResearchError(Exception):
+    pass
+
+
+def throttle(keys):
+    state = AutomationState()
+    now = time.time()
+    wait = 0.0
+    for key in keys or ["global"]:
+        cached = state.cache_get("web_throttle", key)
+        if cached:
+            wait = max(wait, MIN_DOMAIN_DELAY - (now - float(cached["value"])))
+    if wait > 0:
+        time.sleep(min(wait, MIN_DOMAIN_DELAY))
+    now = time.time()
+    for key in keys or ["global"]:
+        state.cache_set("web_throttle", key, now, 300)
+
+
+def run(argv, timeout):
+    result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        raise ResearchError((result.stderr or result.stdout)[-1000:] or "web_command_failed")
+    try:
+        receipt = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ResearchError("web_receipt_invalid") from error
+    if receipt.get("verified") is not True and receipt.get("ok") is not True:
+        raise ResearchError("web_receipt_unverified")
+    return receipt
+
+
+def canonical_result_url(value):
+    """Return a safe canonical result URL, unwrapping known search redirects."""
+    try:
+        parsed = urllib.parse.urlparse(str(value or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.username or parsed.password:
+            return None
+        host = parsed.hostname.lower().rstrip(".")
+        if host in {"duckduckgo.com", "www.duckduckgo.com"} and parsed.path == "/l/":
+            target = urllib.parse.parse_qs(parsed.query).get("uddg", [None])[0]
+            if not target:
+                return None
+            parsed = urllib.parse.urlparse(target)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return None
+            if parsed.username or parsed.password:
+                return None
+        return urllib.parse.urlunparse((
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path or "/",
+            parsed.params,
+            parsed.query,
+            "",
+        ))
+    except (TypeError, ValueError):
+        return None
+
+
+def host_allowed(url, domains):
+    if not domains:
+        return True
+    host = urllib.parse.urlparse(url).hostname.lower().rstrip(".")
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def filter_results(rows, domains, contains):
+    results = []
+    seen = set()
+    needles = [value.casefold() for value in contains if value]
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = canonical_result_url(row.get("url"))
+        if not url or url in seen or not host_allowed(url, domains):
+            continue
+        searchable = " ".join(str(row.get(key) or "") for key in ("title", "snippet", "description"))
+        searchable = (searchable + " " + url).casefold()
+        if any(needle not in searchable for needle in needles):
+            continue
+        cleaned = dict(row)
+        cleaned["url"] = url
+        results.append(cleaned)
+        seen.add(url)
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-research",
+        description="Search and fetch with domain filters, paging, throttling, and source provenance.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    search = commands.add_parser("search")
+    search.add_argument("--query", required=True)
+    search.add_argument("--domain", action="append", default=[])
+    search.add_argument("--contains", action="append", default=[])
+    search.add_argument("--page", type=int, default=1)
+    search.add_argument("--per-page", type=int, default=8)
+    search.add_argument("--timeout", type=int, default=30)
+    fetch = commands.add_parser("fetch")
+    fetch.add_argument("url")
+    fetch.add_argument("--max", type=int, default=50_000)
+    fetch.add_argument("--timeout", type=int, default=30)
+    args = parser.parse_args()
+    try:
+        if safe_mode_status()["active"]:
+            raise ResearchError("local_only_safe_mode_active")
+        observed = dt.datetime.now(dt.timezone.utc).isoformat()
+        if args.command == "search":
+            if not 1 <= args.page <= 4 or not 1 <= args.per_page <= 25:
+                raise ResearchError("pagination_invalid")
+            start = (args.page - 1) * args.per_page
+            if start >= 25:
+                raise ResearchError("provider_result_window_exceeded")
+            domains = []
+            for value in args.domain:
+                host = value.strip().lower().rstrip(".")
+                if not host or urllib.parse.urlparse("https://" + host).hostname != host:
+                    raise ResearchError("domain_invalid")
+                domains.append(host)
+            contains = [value.strip() for value in args.contains if value.strip()]
+            throttle(domains)
+            argv = [SEARCH, "--count", "25", "--timeout", str(args.timeout), "--retries", "3"]
+            query = args.query
+            if domains:
+                sites = " OR ".join(f"site:{domain}" for domain in domains)
+                query = f"{query} ({sites})"
+            argv.append(query)
+            receipt = run(argv, args.timeout + 20)
+            filtered = filter_results(receipt.get("results", []), domains, contains)
+            results = filtered[start:start + args.per_page]
+            provenance = [{
+                "url": row.get("url"), "title": row.get("title"),
+                "rank": start + index + 1, "observedAt": observed,
+                "provider": receipt.get("provider"), "searchStatus": receipt.get("status"),
+            } for index, row in enumerate(results)]
+            output = {
+                "schemaVersion": 1, "action": "Search current web sources with filters and provenance",
+                "processCompleted": True, "taskVerified": True,
+                "query": args.query, "domains": domains, "contains": contains,
+                "page": args.page, "perPage": args.per_page,
+                "results": results, "provenance": provenance,
+                "filteredResultCount": len(filtered),
+                "providerAttempts": receipt.get("providerAttempts", []),
+                "message": f"Returned {len(results)} filtered current source result(s) with provenance.",
+            }
+        else:
+            parsed = urllib.parse.urlparse(args.url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                raise ResearchError("url_invalid")
+            if not 1 <= args.max <= 2 * 1024 * 1024:
+                raise ResearchError("max_invalid")
+            throttle([parsed.hostname.lower()])
+            receipt = run([FETCH, "--max", str(args.max), "--timeout", str(args.timeout), "--retries", "3", args.url], args.timeout + 20)
+            output = {
+                "schemaVersion": 1, "action": "Fetch and read one current web source",
+                "processCompleted": True, "taskVerified": True,
+                "url": args.url, "finalUrl": receipt.get("finalUrl"),
+                "status": receipt.get("status"), "contentType": receipt.get("contentType"),
+                "bytes": receipt.get("bytes"), "text": receipt.get("text"),
+                "links": receipt.get("links", []),
+                "provenance": {
+                    "requestedUrl": args.url, "finalUrl": receipt.get("finalUrl"),
+                    "observedAt": observed, "status": receipt.get("status"),
+                    "attempts": receipt.get("attempts"),
+                    "retryAfter": receipt.get("headers", {}).get("retry-after")
+                    if isinstance(receipt.get("headers"), dict) else None,
+                },
+                "message": "Fetched the source and preserved its URL, final URL, status, time, and retry evidence.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (OSError, ResearchError, ValueError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "error": str(error), "message": "Web research stopped without claiming a source result."}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

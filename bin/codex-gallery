@@ -1,0 +1,713 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Verified Android MediaStore inventory, open, trash, and restore helper."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_rish
+
+
+URIS = {
+    "image": "content://media/external/images/media",
+    "video": "content://media/external/video/media",
+}
+FIELDS = ("_id", "_display_name", "relative_path", "date_added", "date_modified", "mime_type", "_size", "is_trashed")
+ROW_RE = re.compile(r"(?:^|\n)Row:\s+\d+\s+")
+KEY_RE = re.compile(r"(?:^|, )(_id|_display_name|relative_path|date_added|date_modified|mime_type|_size|is_trashed)=")
+
+
+def parser():
+    result = argparse.ArgumentParser(prog="codex-gallery")
+    sub = result.add_subparsers(dest="action", required=True)
+    for name in ("recent", "search"):
+        command = sub.add_parser(name)
+        command.add_argument("--kind", choices=("image", "video", "all"), default="all")
+        command.add_argument("--limit", type=int, default=100)
+        if name == "recent":
+            command.add_argument("--hours", type=int, default=24)
+            command.add_argument("--screenshots", action="store_true")
+        else:
+            command.add_argument("query")
+    faces = sub.add_parser("faces")
+    faces.add_argument("--hours", type=int, default=24 * 365)
+    faces.add_argument("--limit", type=int, default=100)
+    faces.add_argument("--offset", type=int, default=0)
+    faces.add_argument("--min-faces", type=int, default=1)
+    faces.add_argument("--no-present", action="store_true")
+    semantic = sub.add_parser("semantic")
+    semantic.add_argument("query")
+    semantic.add_argument("--hours", type=int, default=24 * 365)
+    semantic.add_argument("--limit", type=int, default=25)
+    semantic.add_argument("--offset", type=int, default=0)
+    semantic.add_argument("--no-present", action="store_true")
+    for name in ("inspect", "metadata", "ocr", "open", "share", "delete", "restore"):
+        command = sub.add_parser(name)
+        command.add_argument("--kind", choices=("image", "video"), required=True)
+        command.add_argument("--id", type=int, required=True)
+        if name in {"delete", "restore"}:
+            command.add_argument("--confirm", required=True)
+    export = sub.add_parser("export")
+    export.add_argument("--kind", choices=("image", "video"), required=True)
+    export.add_argument("--id", type=int, required=True)
+    export.add_argument("--output", required=True)
+    export.add_argument("--format", choices=("original", "jpeg", "png", "webp"), default="original")
+    export.add_argument("--max-edge", type=int, default=4096)
+    export.add_argument("--quality", type=int, default=90)
+    return result
+
+
+def parse_rows(output, kind):
+    records = []
+    for raw in ROW_RE.split("\n" + output)[1:]:
+        matches = list(KEY_RE.finditer(raw.strip()))
+        record = {"kind": kind}
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+            value = raw[match.end():end].strip().removesuffix(",")
+            record[match.group(1)] = None if value == "NULL" else value
+        if str(record.get("_id", "")).isdigit():
+            for key in ("_id", "date_added", "date_modified", "_size", "is_trashed"):
+                if str(record.get(key, "")).isdigit():
+                    record[key] = int(record[key])
+            records.append(record)
+    return records
+
+
+def query_kind(kind, *, include_trashed=False):
+    projection = ":".join(FIELDS)
+    where = "is_pending=0" if include_trashed else "is_trashed=0 AND is_pending=0"
+    command = (
+        f"content query --user 0 --uri {shlex.quote(URIS[kind])} "
+        f"--projection {shlex.quote(projection)} --where {shlex.quote(where)}"
+    )
+    result = run_rish(command)
+    return parse_rows(result.stdout, kind)
+
+
+def selected_kinds(kind):
+    return ("image", "video") if kind == "all" else (kind,)
+
+
+def inventory(args):
+    if not 1 <= args.limit <= 1000:
+        raise AndroidPolicyError("gallery_limit")
+    records = [record for kind in selected_kinds(args.kind) for record in query_kind(kind)]
+    if args.action == "recent":
+        if not 1 <= args.hours <= 24 * 365:
+            raise AndroidPolicyError("gallery_hours")
+        threshold = int(time.time()) - args.hours * 3600
+        records = [record for record in records if int(record.get("date_added") or 0) >= threshold]
+        if args.screenshots:
+            records = [record for record in records if "screenshot" in (
+                str(record.get("_display_name") or "") + " " + str(record.get("relative_path") or "")
+            ).casefold()]
+    else:
+        query = args.query.strip().casefold()
+        if not query or len(query) > 200:
+            raise AndroidPolicyError("gallery_query")
+        records = [record for record in records if query in (
+            str(record.get("_display_name") or "") + " " + str(record.get("relative_path") or "")
+        ).casefold()]
+    records.sort(key=lambda record: (int(record.get("date_added") or 0), int(record["_id"])), reverse=True)
+    records = records[:args.limit]
+    return {"ok": True, "count": len(records), "items": records, "verified": True}
+
+
+def safe_media_path(record):
+    relative = str(record.get("relative_path") or "")
+    name = str(record.get("_display_name") or "")
+    if not name or "/" in name or "\\" in name or "\x00" in name:
+        return None
+    parts = pathlib.PurePosixPath(relative).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    path = pathlib.PurePosixPath("/storage/emulated/0", *parts, name)
+    return str(path) if str(path).startswith("/storage/emulated/0/") else None
+
+
+def progress(message):
+    print(f"Gallery progress: {message}", file=sys.stderr, flush=True)
+
+
+def presentation_sheets(items, label):
+    if not items:
+        return []
+    from PIL import Image, ImageDraw, ImageOps
+
+    project = pathlib.Path(__file__).resolve().parents[1]
+    run = project / "workspace" / "gallery-presentations" / f"{int(time.time())}-{time.time_ns() % 1_000_000_000:09d}"
+    run.mkdir(mode=0o700, parents=True, exist_ok=False)
+    columns, rows, tile_width, tile_height = 3, 3, 320, 350
+    margin, header = 28, 88
+    width = margin * 2 + columns * tile_width
+    height = header + margin + rows * tile_height
+    sheets = []
+    for page, start in enumerate(range(0, len(items), columns * rows), 1):
+        page_items = items[start:start + columns * rows]
+        sheet = Image.new("RGB", (width, height), (6, 10, 24))
+        draw = ImageDraw.Draw(sheet)
+        draw.text((margin, 24), f"{label} — page {page}", fill=(232, 255, 247))
+        for index, item in enumerate(page_items):
+            column, row = index % columns, index // columns
+            left = margin + column * tile_width
+            top = header + row * tile_height
+            image_box = (left + 8, top + 8, left + tile_width - 8, top + 286)
+            try:
+                with Image.open(str(item["path"])) as opened:
+                    source = ImageOps.exif_transpose(opened).convert("RGB")
+                    source.thumbnail((image_box[2] - image_box[0], image_box[3] - image_box[1]))
+                    x = image_box[0] + (image_box[2] - image_box[0] - source.width) // 2
+                    y = image_box[1] + (image_box[3] - image_box[1] - source.height) // 2
+                    sheet.paste(source, (x, y))
+            except (OSError, ValueError):
+                draw.rectangle(image_box, fill=(30, 38, 58), outline=(255, 107, 129), width=3)
+                draw.text((image_box[0] + 16, image_box[1] + 122), "Preview unavailable", fill=(255, 205, 213))
+            name = str(item.get("_display_name") or f"Media ID {item.get('_id')}").replace("\n", " ")[:42]
+            details = f"ID {item.get('_id')}"
+            if isinstance(item.get("faceCount"), int):
+                details += f" • {item['faceCount']} face(s)"
+            draw.text((left + 12, top + 296), name, fill=(232, 255, 247))
+            draw.text((left + 12, top + 320), details, fill=(75, 230, 201))
+        target = run / f"{label.casefold().replace(' ', '-')}-{page:03d}.jpg"
+        with tempfile.NamedTemporaryFile(dir=run, prefix=f".{target.name}.", delete=False) as stream:
+            temporary = pathlib.Path(stream.name)
+        try:
+            sheet.save(temporary, format="JPEG", quality=88, optimize=True)
+            temporary.chmod(0o600)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        sheets.append({
+            "path": str(target),
+            "sha256": file_digest(target),
+            "bytes": target.stat().st_size,
+            "itemCount": len(page_items),
+            "page": page,
+            "verified": True,
+        })
+    return sheets
+
+
+def detect_face_batches(paths, remote_jar, batch_size=32):
+    by_path = {}
+    for start in range(0, len(paths), batch_size):
+        batch = paths[start:start + batch_size]
+        progress(f"checking images {start + 1}–{start + len(batch)} of {len(paths)} for visible faces.")
+        command = (
+            f"CLASSPATH={shlex.quote(remote_jar)} app_process /system/bin "
+            "com.michaelovsky.nemotronunrestricted.tools.NemotronFaceDetector "
+            + " ".join(shlex.quote(path) for path in batch)
+        )
+        detected = run_rish(command, timeout=max(30, len(batch) * 4), require_success=False)
+        if detected.remote_status != 0:
+            raise AndroidBridgeError("face_detector_failed")
+        for line in detected.stdout.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and isinstance(value.get("path"), str):
+                by_path[value["path"]] = value
+    return by_path
+
+
+def face_inventory(args):
+    offset = getattr(args, "offset", 0)
+    no_present = getattr(args, "no_present", True)
+    if (
+        not 1 <= args.limit <= 250
+        or not 0 <= offset <= 10_000_000
+        or not 1 <= args.hours <= 24 * 365 * 10
+        or not 1 <= args.min_faces <= 64
+    ):
+        raise AndroidPolicyError("gallery_face_bounds")
+    threshold = int(time.time()) - args.hours * 3600
+    all_candidates = [
+        record for record in query_kind("image")
+        if int(record.get("date_added") or 0) >= threshold and safe_media_path(record)
+    ]
+    all_candidates.sort(key=lambda record: (int(record.get("date_added") or 0), int(record["_id"])), reverse=True)
+    total_candidates = len(all_candidates)
+    candidates = all_candidates[offset:offset + args.limit]
+    progress(
+        f"found {total_candidates} eligible gallery images; processing offset {offset} "
+        f"through {offset + len(candidates)}."
+    )
+    project = pathlib.Path(__file__).resolve().parents[1]
+    progress("building and integrity-checking the local Android face detector.")
+    build = subprocess.run(
+        [str(project / "build-face-detector.sh")], text=True, capture_output=True, timeout=120, check=False,
+    )
+    if build.returncode != 0:
+        raise AndroidBridgeError("face_detector_build_failed")
+    jar_lines = [line.strip() for line in build.stdout.splitlines() if line.strip()]
+    if not jar_lines:
+        raise AndroidBridgeError("face_detector_missing")
+    trusted_jar = pathlib.Path(jar_lines[-1])
+    digest = hashlib.sha256(trusted_jar.read_bytes()).hexdigest()
+    shared_stage = pathlib.Path("/storage/emulated/0/Download/.nemotron-tools/nemotron-face-detector.jar")
+    shared_stage.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(trusted_jar, shared_stage)
+    shared_stage.chmod(0o644)
+    remote_jar = f"/data/local/tmp/nemotron-face-detector-{digest}.jar"
+    staged = run_rish(
+        f"cp {shlex.quote(str(shared_stage))} {shlex.quote(remote_jar)}", require_success=False,
+    )
+    if staged.remote_status != 0:
+        raise AndroidBridgeError("face_detector_stage_failed")
+    remote_hash = run_rish(f"sha256sum {shlex.quote(remote_jar)}", require_success=False)
+    if remote_hash.remote_status != 0 or digest not in remote_hash.stdout.casefold():
+        raise AndroidBridgeError("face_detector_integrity_failed")
+    paths = [safe_media_path(record) for record in candidates]
+    by_path = detect_face_batches(paths, remote_jar)
+    items = []
+    for record, path in zip(candidates, paths):
+        result = by_path.get(path, {"faceCount": 0, "error": "no_detector_result"})
+        count = result.get("faceCount") if isinstance(result.get("faceCount"), int) else 0
+        if count >= args.min_faces:
+            items.append({**record, "faceCount": count, "detector": "android-local", "path": path})
+    presentations = [] if no_present else presentation_sheets(items, "Face matches")
+    progress(f"found {len(items)} matching images and created {len(presentations)} presentation sheet(s).")
+    consumed = offset + len(candidates)
+    has_more = consumed < total_candidates
+    return {
+        "ok": True, "count": len(items), "scanned": len(candidates), "items": items,
+        "totalCandidates": total_candidates, "offset": offset, "hasMore": has_more,
+        "nextOffset": consumed if has_more else None, "presentations": presentations,
+        "verified": len(by_path) == len(candidates), "scope": "face-presence-only-no-identity-or-gender-inference",
+        "renderInstruction": "Render every presentations[].path inline, then continue nextOffset while hasMore is true.",
+    }
+
+
+def configured_proxy_port(project):
+    state = project / "runtime" / ".codex" / "supervisor" / "ports.env"
+    values = {}
+    for line in state.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and value.isdigit():
+            values[key] = int(value)
+    port = values.get("NEMOTRON_PROXY_PORT")
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise AndroidBridgeError("gallery_proxy_port_missing")
+    return port
+
+
+def image_data_url(path):
+    from PIL import Image, ImageOps
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((1280, 1280))
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def parse_json_object(text):
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        stripped = "\n".join(lines[1:-1]).strip() if len(lines) >= 3 else ""
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def vision_match(port, query, path):
+    prompt = (
+        "Compare this image with the user's visual search query. Return JSON only with keys "
+        "match (boolean), description (short factual visible description), and reason (short). "
+        "Do not infer identity, gender, ethnicity, health, religion, or other sensitive attributes. "
+        f"Query: {query}"
+    )
+    payload = {
+        "model": "nousresearch/hermes-4-405b",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_data_url(path)}},
+        ]}],
+        "max_tokens": 180,
+        "temperature": 0,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        body = response.read(1024 * 1024 + 1)
+    if len(body) > 1024 * 1024:
+        raise AndroidBridgeError("gallery_vision_response_too_large")
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+        content = decoded["choices"][0]["message"]["content"]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        raise AndroidBridgeError("gallery_vision_response_invalid") from error
+    result = parse_json_object(content)
+    if result is None or not isinstance(result.get("match"), bool):
+        raise AndroidBridgeError("gallery_vision_result_invalid")
+    return {
+        "match": result["match"],
+        "description": str(result.get("description") or "")[:500],
+        "reason": str(result.get("reason") or "")[:500],
+    }
+
+
+def vision_ocr(port, path):
+    prompt = (
+        "Transcribe only text visibly present in this image. Return JSON only with keys "
+        "text (string), language (BCP-47 string or empty), and blocks (array of short strings). "
+        "Preserve reading order, do not infer hidden text, and return an empty string when no text is visible."
+    )
+    payload = {
+        "model": "nousresearch/hermes-4-405b",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_data_url(path)}},
+        ]}],
+        "max_tokens": 1600,
+        "temperature": 0,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        body = response.read(2 * 1024 * 1024 + 1)
+    if len(body) > 2 * 1024 * 1024:
+        raise AndroidBridgeError("gallery_ocr_response_too_large")
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+        content = decoded["choices"][0]["message"]["content"]
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+        raise AndroidBridgeError("gallery_ocr_response_invalid") from error
+    result = parse_json_object(content)
+    if result is None or not isinstance(result.get("text"), str):
+        raise AndroidBridgeError("gallery_ocr_result_invalid")
+    blocks = result.get("blocks")
+    if not isinstance(blocks, list) or any(not isinstance(block, str) for block in blocks):
+        blocks = []
+    return {
+        "text": result["text"][:100_000],
+        "language": str(result.get("language") or "")[:64],
+        "blocks": [block[:2000] for block in blocks[:500]],
+    }
+
+
+def semantic_inventory(args):
+    offset = getattr(args, "offset", 0)
+    no_present = getattr(args, "no_present", True)
+    query = args.query.strip()
+    if (
+        not query or len(query) > 300
+        or not 1 <= args.limit <= 50
+        or not 0 <= offset <= 10_000_000
+        or not 1 <= args.hours <= 24 * 365 * 10
+    ):
+        raise AndroidPolicyError("gallery_semantic_bounds")
+    sensitive = {"man", "men", "male", "woman", "women", "female", "gender", "ethnicity", "race"}
+    words = set(re.findall(r"[a-z]+", query.casefold()))
+    if words & sensitive:
+        progress(
+            "I cannot infer identity, gender, ethnicity, or another sensitive personal attribute from appearance. "
+            "I can safely scan for face presence and render those results, or search non-sensitive visible details."
+        )
+        raise AndroidPolicyError("gallery_sensitive_attribute_inference")
+    threshold = int(time.time()) - args.hours * 3600
+    all_candidates = [record for record in query_kind("image") if int(record.get("date_added") or 0) >= threshold and safe_media_path(record)]
+    all_candidates.sort(key=lambda record: (int(record.get("date_added") or 0), int(record["_id"])), reverse=True)
+    total_candidates = len(all_candidates)
+    candidates = all_candidates[offset:offset + args.limit]
+    progress(
+        f"found {total_candidates} eligible gallery images; comparing offset {offset} "
+        f"through {offset + len(candidates)} with the visible-content query."
+    )
+    project = pathlib.Path(__file__).resolve().parents[1]
+    port = configured_proxy_port(project)
+    items, errors = [], []
+    for index, record in enumerate(candidates, 1):
+        progress(f"comparing image {index} of {len(candidates)} with the requested visible details.")
+        path = safe_media_path(record)
+        try:
+            result = vision_match(port, query, path)
+        except (AndroidBridgeError, OSError, urllib.error.URLError, TimeoutError) as error:
+            errors.append({"id": record["_id"], "error": str(error)})
+            continue
+        if result["match"]:
+            items.append({**record, "path": path, "description": result["description"], "reason": result["reason"]})
+    presentations = [] if no_present else presentation_sheets(items, "Semantic matches")
+    consumed = offset + len(candidates)
+    has_more = consumed < total_candidates
+    progress(f"found {len(items)} matching images and created {len(presentations)} presentation sheet(s).")
+    return {
+        "ok": not errors, "count": len(items), "scanned": len(candidates), "items": items,
+        "errors": errors, "verified": not errors, "totalCandidates": total_candidates,
+        "offset": offset, "hasMore": has_more, "nextOffset": consumed if has_more else None,
+        "presentations": presentations,
+        "scope": "visible-content-search-no-identity-or-sensitive-attribute-inference",
+        "renderInstruction": "Render every presentations[].path inline, then continue nextOffset while hasMore is true.",
+    }
+
+
+def exact_record(kind, media_id, *, include_trashed=False):
+    if not 1 <= media_id <= 2**63 - 1:
+        raise AndroidPolicyError("gallery_id")
+    matches = [record for record in query_kind(kind, include_trashed=include_trashed) if record["_id"] == media_id]
+    return matches[0] if len(matches) == 1 else None
+
+
+def exact_path_record(kind, media_id):
+    record = exact_record(kind, media_id)
+    if record is None:
+        raise AndroidPolicyError("media_id_not_found")
+    path_value = safe_media_path(record)
+    if path_value is None:
+        raise AndroidPolicyError("media_path_invalid")
+    path = pathlib.Path(path_value)
+    if not path.is_file() or path.is_symlink():
+        raise AndroidPolicyError("media_file_unavailable")
+    return record, path
+
+
+def metadata_action(args):
+    record, path = exact_path_record(args.kind, args.id)
+    executable = shutil.which("exiftool")
+    if executable is None:
+        raise AndroidBridgeError("metadata_tool_unavailable")
+    completed = subprocess.run(
+        [executable, "-json", "-G1", "-struct", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AndroidBridgeError("metadata_read_failed")
+    try:
+        values = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise AndroidBridgeError("metadata_result_invalid") from error
+    if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+        raise AndroidBridgeError("metadata_result_invalid")
+    metadata = {
+        str(key)[:200]: value
+        for key, value in values[0].items()
+        if isinstance(value, (str, int, float, bool)) or value is None
+    }
+    return {
+        "ok": True, "item": record, "metadata": metadata, "metadataTool": "exiftool",
+        "verified": True,
+    }
+
+
+def ocr_action(args):
+    if args.kind != "image":
+        raise AndroidPolicyError("gallery_ocr_image_only")
+    record, path = exact_path_record(args.kind, args.id)
+    project = pathlib.Path(__file__).resolve().parents[1]
+    result = vision_ocr(configured_proxy_port(project), str(path))
+    return {
+        "ok": True, "item": record, **result, "verified": True,
+        "scope": "visible-text-transcription-only",
+    }
+
+
+def safe_export_path(value):
+    project = pathlib.Path(__file__).resolve().parents[1]
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        path = project / path
+    path = path.resolve()
+    allowed = (project / "workspace", project / "runtime" / "downloads")
+    if not any(path == root.resolve() or root.resolve() in path.parents for root in allowed):
+        raise AndroidPolicyError("gallery_export_path")
+    if path.exists() or path.is_symlink():
+        raise AndroidPolicyError("gallery_export_exists")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def file_digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def export_action(args):
+    record, source = exact_path_record(args.kind, args.id)
+    output = safe_export_path(args.output)
+    if not 64 <= args.max_edge <= 16384 or not 1 <= args.quality <= 100:
+        raise AndroidPolicyError("gallery_export_bounds")
+    if args.kind == "video" and args.format != "original":
+        raise AndroidPolicyError("gallery_video_transform_tool_unavailable")
+    transformed = args.format != "original"
+    try:
+        if not transformed:
+            shutil.copy2(source, output)
+        else:
+            from PIL import Image, ImageOps
+            with Image.open(source) as opened:
+                image = ImageOps.exif_transpose(opened)
+                image.thumbnail((args.max_edge, args.max_edge))
+                if args.format == "jpeg":
+                    image = image.convert("RGB")
+                    image.save(output, format="JPEG", quality=args.quality, optimize=True)
+                elif args.format == "png":
+                    image.save(output, format="PNG", optimize=True)
+                else:
+                    image.save(output, format="WEBP", quality=args.quality, method=6)
+    except Exception:
+        try:
+            output.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    if not output.is_file() or output.stat().st_size <= 0:
+        raise AndroidBridgeError("gallery_export_verification_failed")
+    return {
+        "ok": True, "item": record, "output": str(output), "bytes": output.stat().st_size,
+        "sha256": file_digest(output), "format": args.format, "transformed": transformed,
+        "originalPreserved": True, "metadataPreserved": not transformed, "verified": True,
+    }
+
+
+def share_action(args):
+    record, path = exact_path_record(args.kind, args.id)
+    executable = shutil.which("termux-share")
+    if executable is None:
+        raise AndroidBridgeError("share_tool_unavailable")
+    completed = subprocess.run(
+        [executable, "-a", "send", "-t", str(record.get("mime_type") or "*/*"), str(path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    ok = completed.returncode == 0
+    return {
+        "ok": ok, "item": record, "shareIntentDispatched": ok,
+        "userTargetSelectionMayBeRequired": True, "verified": ok,
+    }, 0 if ok else 5
+
+
+def exact_action(args):
+    record = exact_record(args.kind, args.id, include_trashed=args.action == "restore")
+    if record is None:
+        return {"ok": False, "error": "media_id_not_found", "verified": False}, 4
+    uri = f"{URIS[args.kind]}/{args.id}"
+    if args.action == "inspect":
+        return {"ok": True, "item": record, "verified": True}, 0
+    if args.action == "open":
+        result = run_rish(
+            f"am start -W -a android.intent.action.VIEW -d {shlex.quote(uri)} "
+            f"-t {shlex.quote(str(record.get('mime_type') or '*/*'))} --grant-read-uri-permission",
+            require_success=False,
+        )
+        ok = result.remote_status == 0
+        return {"ok": ok, "item": record, "uri": uri, "remoteStatus": result.remote_status, "verified": ok}, 0 if ok else 5
+    if args.action == "restore":
+        if int(record.get("is_trashed") or 0) != 1:
+            return {"ok": False, "error": "media_id_is_not_trashed", "verified": False}, 4
+        expected = f"RESTORE_MEDIA_ID_{args.id}"
+        if args.confirm != expected:
+            raise AndroidPolicyError("gallery_restore_confirmation")
+        result = run_rish(
+            f"content update --user 0 --uri {shlex.quote(URIS[args.kind])} "
+            f"--bind is_trashed:i:0 --where '_id={args.id}'",
+            require_success=False,
+        )
+        restored = exact_record(args.kind, args.id)
+        ok = result.remote_status == 0 and restored is not None and int(restored.get("is_trashed") or 0) == 0
+        write_audit("restore", record, restored)
+        return {
+            "ok": ok, "restoredId": args.id, "kind": args.kind,
+            "verifiedPresent": restored is not None, "item": restored, "verified": ok,
+        }, 0 if ok else 5
+
+    expected = f"DELETE_MEDIA_ID_{args.id}"
+    if args.confirm != expected:
+        raise AndroidPolicyError("gallery_delete_confirmation")
+    result = run_rish(
+        f"content update --user 0 --uri {shlex.quote(URIS[args.kind])} "
+        f"--bind is_trashed:i:1 --where '_id={args.id}'",
+        require_success=False,
+    )
+    absent = exact_record(args.kind, args.id) is None
+    trashed = exact_record(args.kind, args.id, include_trashed=True)
+    ok = result.remote_status == 0 and absent and trashed is not None and int(trashed.get("is_trashed") or 0) == 1
+    write_audit("trash", record, trashed)
+    return {
+        "ok": ok, "trashedId": args.id, "kind": args.kind,
+        "restoreConfirmation": f"RESTORE_MEDIA_ID_{args.id}",
+        "verifiedAbsentFromGallery": absent, "verifiedRecoverable": trashed is not None, "verified": ok,
+    }, 0 if ok else 5
+
+
+def write_audit(action, before, after):
+    audit = pathlib.Path(__file__).resolve().parents[1] / "runtime" / ".codex" / "audit" / "media-deletions.jsonl"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    with audit.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"at": int(time.time()), "action": action, "before": before, "after": after}, sort_keys=True) + "\n")
+        stream.flush()
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        if args.action in {"recent", "search"}:
+            print(json.dumps(inventory(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "faces":
+            print(json.dumps(face_inventory(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "semantic":
+            print(json.dumps(semantic_inventory(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "metadata":
+            print(json.dumps(metadata_action(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "ocr":
+            print(json.dumps(ocr_action(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "export":
+            print(json.dumps(export_action(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "share":
+            payload, status = share_action(args)
+            print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+            return status
+        payload, status = exact_action(args)
+        print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        return status
+    except (AndroidPolicyError, AndroidBridgeError, OSError) as error:
+        print(json.dumps({"ok": False, "error": str(error), "verified": False}, separators=(",", ":")), file=sys.stderr)
+        return 77
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

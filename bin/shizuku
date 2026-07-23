@@ -1,0 +1,5 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+PROJECT_BIN="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec "$PROJECT_BIN/codex-shizuku" "$@"

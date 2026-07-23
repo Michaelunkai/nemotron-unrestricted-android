@@ -1,0 +1,313 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Perform confined, checksum-verified file and archive operations."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import pathlib
+import shutil
+import stat
+import sys
+import tempfile
+import zipfile
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+ALLOWED_ROOTS = tuple(
+    path.resolve()
+    for path in (
+        ROOT,
+        ROOT / "workspace",
+        ROOT / "runtime" / "home",
+        ROOT / "runtime" / "downloads",
+        ROOT / "build",
+    )
+)
+PROTECTED_ROOTS = tuple(
+    path.resolve()
+    for path in (
+        ROOT / ".git",
+        ROOT / "runtime" / ".codex",
+        ROOT / "signing",
+    )
+)
+MAX_ARCHIVE_ENTRIES = 20_000
+MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
+
+
+class FileError(ValueError):
+    pass
+
+
+def emit(payload: dict, *, error: bool = False) -> None:
+    print(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        file=sys.stderr if error else sys.stdout,
+    )
+
+
+def confined(value: str, *, existing: bool = False) -> pathlib.Path:
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    try:
+        resolved = path.resolve(strict=existing)
+    except OSError as error:
+        raise FileError("path_unavailable") from error
+    if not any(resolved == root or root in resolved.parents for root in ALLOWED_ROOTS):
+        raise FileError("path_outside_managed_roots")
+    if any(resolved == root or root in resolved.parents for root in PROTECTED_ROOTS):
+        raise FileError("protected_private_path")
+    if existing and (path.is_symlink() or resolved.is_symlink()):
+        raise FileError("symlink_refused")
+    return resolved
+
+
+def sha256(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def regular_file(value: str) -> pathlib.Path:
+    path = confined(value, existing=True)
+    if not path.is_file() or not stat.S_ISREG(path.stat().st_mode):
+        raise FileError("regular_file_required")
+    return path
+
+
+def tree_manifest(root: pathlib.Path) -> list[dict]:
+    entries = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise FileError("symlink_refused")
+        if path.is_file():
+            entries.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path),
+                }
+            )
+    return entries
+
+
+def safe_member(name: str) -> pathlib.PurePosixPath:
+    if not name or "\0" in name or "\\" in name:
+        raise FileError("archive_member_invalid")
+    member = pathlib.PurePosixPath(name)
+    if member.is_absolute() or ".." in member.parts:
+        raise FileError("archive_traversal_refused")
+    return member
+
+
+def inspect_archive(path: pathlib.Path) -> dict:
+    if not zipfile.is_zipfile(path):
+        raise FileError("zip_archive_required")
+    entries = []
+    expanded = 0
+    with zipfile.ZipFile(path) as archive:
+        infos = archive.infolist()
+        if len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise FileError("archive_entry_limit")
+        for info in infos:
+            member = safe_member(info.filename)
+            mode = (info.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(mode):
+                raise FileError("archive_link_refused")
+            expanded += info.file_size
+            if expanded > MAX_ARCHIVE_BYTES:
+                raise FileError("archive_expansion_limit")
+            entries.append(
+                {
+                    "path": member.as_posix(),
+                    "bytes": info.file_size,
+                    "directory": info.is_dir(),
+                    "crc32": f"{info.CRC:08x}",
+                }
+            )
+    return {
+        "entries": entries,
+        "entryCount": len(entries),
+        "expandedBytes": expanded,
+        "sha256": sha256(path),
+        "bytes": path.stat().st_size,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Inspect, hash, copy, create, and extract files under managed roots."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    inspect_parser = commands.add_parser("inspect")
+    inspect_parser.add_argument("path")
+    checksum = commands.add_parser("checksum")
+    checksum.add_argument("path")
+    copy = commands.add_parser("copy")
+    copy.add_argument("source")
+    copy.add_argument("destination")
+    archive_list = commands.add_parser("archive-list")
+    archive_list.add_argument("archive")
+    archive_create = commands.add_parser("archive-create")
+    archive_create.add_argument("output")
+    archive_create.add_argument("inputs", nargs="+")
+    archive_extract = commands.add_parser("archive-extract")
+    archive_extract.add_argument("archive")
+    archive_extract.add_argument("destination")
+    args = parser.parse_args()
+    try:
+        if args.command in {"inspect", "checksum"}:
+            path = regular_file(args.path)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "path": str(path),
+                "bytes": path.stat().st_size,
+                "sha256": sha256(path),
+                "message": "Read the exact file and verified its SHA-256 checksum.",
+            }
+            if args.command == "inspect":
+                output["mimeType"] = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                output["modifiedEpoch"] = int(path.stat().st_mtime)
+        elif args.command == "copy":
+            source = regular_file(args.source)
+            destination = confined(args.destination)
+            if destination.exists() or destination.is_symlink():
+                raise FileError("destination_exists")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source_hash = sha256(source)
+            descriptor, temporary_name = tempfile.mkstemp(prefix="." + destination.name + ".", dir=destination.parent)
+            os.close(descriptor)
+            temporary = pathlib.Path(temporary_name)
+            try:
+                shutil.copyfile(source, temporary)
+                os.chmod(temporary, source.stat().st_mode & 0o777)
+                if sha256(temporary) != source_hash:
+                    raise FileError("copy_checksum_mismatch")
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": destination.is_file() and sha256(destination) == source_hash,
+                "source": str(source),
+                "destination": str(destination),
+                "bytes": destination.stat().st_size,
+                "sha256": source_hash,
+                "message": "Copied the file without overwriting and verified the destination checksum.",
+            }
+        elif args.command == "archive-list":
+            archive = regular_file(args.archive)
+            proof = inspect_archive(archive)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "archive": str(archive),
+                **proof,
+                "message": "Inspected every ZIP member without extracting or executing archive content.",
+            }
+        elif args.command == "archive-create":
+            output_path = confined(args.output)
+            if output_path.suffix.lower() != ".zip":
+                raise FileError("zip_output_required")
+            if output_path.exists() or output_path.is_symlink():
+                raise FileError("destination_exists")
+            sources = [confined(value, existing=True) for value in args.inputs]
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(prefix="." + output_path.name + ".", dir=output_path.parent)
+            os.close(descriptor)
+            temporary = pathlib.Path(temporary_name)
+            try:
+                with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    used = set()
+                    for source in sources:
+                        base = source.name
+                        if base in used:
+                            raise FileError("duplicate_archive_root")
+                        used.add(base)
+                        candidates = [source] if source.is_file() else [path for path in sorted(source.rglob("*")) if path.is_file()]
+                        for candidate in candidates:
+                            if candidate.is_symlink():
+                                raise FileError("symlink_refused")
+                            relative = pathlib.PurePosixPath(base) if source.is_file() else pathlib.PurePosixPath(base) / candidate.relative_to(source).as_posix()
+                            safe_member(relative.as_posix())
+                            archive.write(candidate, relative.as_posix())
+                proof = inspect_archive(temporary)
+                os.replace(temporary, output_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": sha256(output_path) == proof["sha256"],
+                "archive": str(output_path),
+                **proof,
+                "message": "Created the ZIP without overwriting and reopened it to verify every member and checksum.",
+            }
+        else:
+            archive = regular_file(args.archive)
+            proof = inspect_archive(archive)
+            destination = confined(args.destination)
+            if destination.exists() or destination.is_symlink():
+                raise FileError("destination_exists")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            staging = pathlib.Path(tempfile.mkdtemp(prefix="." + destination.name + ".", dir=destination.parent))
+            try:
+                with zipfile.ZipFile(archive) as source:
+                    for info in source.infolist():
+                        member = safe_member(info.filename)
+                        target = staging.joinpath(*member.parts)
+                        resolved = target.resolve()
+                        if staging != resolved and staging not in resolved.parents:
+                            raise FileError("archive_traversal_refused")
+                        if info.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with source.open(info) as input_stream, target.open("xb") as output_stream:
+                            shutil.copyfileobj(input_stream, output_stream)
+                manifest = tree_manifest(staging)
+                if len(manifest) != sum(not item["directory"] for item in proof["entries"]):
+                    raise FileError("archive_extract_count_mismatch")
+                os.replace(staging, destination)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": tree_manifest(destination) == manifest,
+                "archive": str(archive),
+                "destination": str(destination),
+                "files": manifest,
+                "archiveSha256": proof["sha256"],
+                "message": "Extracted the pre-inspected ZIP into a new directory and verified every file checksum.",
+            }
+        emit(output)
+        return 0 if output["taskVerified"] else 2
+    except (FileError, OSError, zipfile.BadZipFile) as error:
+        emit(
+            {
+                "schemaVersion": 1,
+                "processCompleted": False,
+                "taskVerified": False,
+                "error": str(error),
+                "message": "The file operation stopped without overwriting or claiming an unverified result.",
+            },
+            error=True,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

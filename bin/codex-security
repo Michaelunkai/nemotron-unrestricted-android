@@ -1,0 +1,181 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Read-only security audit and bounded artifact sandbox inspection."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+import tarfile
+import zipfile
+
+from nemotron_android_policy import AndroidPolicyError, validate_android_shell_command
+from nemotron_powershell_policy import PolicyViolation, validate_powershell_command
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DOCTOR = ROOT / "bin" / "codex-doctor"
+REGISTRY = ROOT / "bin" / "codex-registry"
+NETDIAG = ROOT / "bin" / "codex-netdiag"
+SECRET_SCAN = ROOT / "scan-nemotron-secrets.py"
+MANAGED = ROOT / "runtime" / ".codex" / "automation" / "managed-artifacts"
+
+
+class SecurityError(Exception):
+    pass
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def json_command(argv, timeout):
+    completed = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=timeout, check=False)
+    stream = completed.stdout if completed.returncode == 0 else completed.stderr
+    try:
+        value = json.loads(stream)
+    except json.JSONDecodeError as error:
+        raise SecurityError("security_receipt_invalid:" + pathlib.Path(argv[0]).name) from error
+    return completed.returncode, value
+
+
+def policy_checks():
+    blocked = []
+    for name, function, command in (
+        ("android-delete", validate_android_shell_command, "rm -rf /"),
+        ("android-package-clear", validate_android_shell_command, "pm clear com.termux"),
+        ("powershell-delete", validate_powershell_command, "Remove-Item C:\\Users\\user\\file"),
+        ("powershell-dynamic", validate_powershell_command, "Invoke-Expression 'whoami'"),
+    ):
+        try:
+            function(command)
+        except (AndroidPolicyError, PolicyViolation, ValueError):
+            blocked.append(name)
+    return {"verified": len(blocked) == 4, "blockedProbes": blocked}
+
+
+def sensitive_modes():
+    candidates = [
+        ROOT / "build" / "signing.properties",
+        ROOT / "build" / "nemotron-unrestricted.keystore",
+        ROOT / "runtime" / ".codex" / "auth.json",
+        ROOT / "runtime" / ".codex" / "config.toml",
+    ]
+    checks = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        mode = stat.S_IMODE(path.stat().st_mode)
+        checks.append({"path": str(path.relative_to(ROOT)), "mode": oct(mode), "private": mode & 0o077 == 0})
+    return {"verified": all(item["private"] for item in checks), "files": checks}
+
+
+def managed_artifacts():
+    registry_path = MANAGED / "registry.json"
+    if not registry_path.exists():
+        return {"verified": True, "count": 0, "message": "No managed artifact registry exists yet."}
+    value = json.loads(registry_path.read_text(encoding="utf-8"))
+    checks = []
+    for artifact_id, record in value.get("artifacts", {}).items():
+        path = MANAGED / record["managedRelativePath"]
+        valid = path.is_file() and not path.is_symlink() and sha256(path) == record["sha256"] and path.stat().st_size == record["bytes"]
+        checks.append({"id": artifact_id, "state": record.get("state"), "verified": valid})
+    return {"verified": all(item["verified"] for item in checks), "count": len(checks), "items": checks}
+
+
+def archive_members(path):
+    members = []
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            for item in archive.infolist():
+                members.append((item.filename, item.file_size, (item.external_attr >> 16) & 0o170000 == stat.S_IFLNK))
+    elif tarfile.is_tarfile(path):
+        with tarfile.open(path) as archive:
+            for item in archive.getmembers():
+                members.append((item.name, item.size, item.issym() or item.islnk()))
+    return members
+
+
+def artifact(path):
+    requested = pathlib.Path(path).expanduser().absolute()
+    if requested.is_symlink():
+        raise SecurityError("artifact_invalid")
+    target = requested.resolve(strict=True)
+    if not target.is_file():
+        raise SecurityError("artifact_invalid")
+    if target.stat().st_size > 2 * 1024 * 1024 * 1024:
+        raise SecurityError("artifact_too_large")
+    members = archive_members(target)
+    if len(members) > 20_000:
+        raise SecurityError("archive_member_limit")
+    total = 0
+    unsafe = []
+    for name, size, link in members:
+        member = pathlib.PurePosixPath(name.replace("\\", "/"))
+        total += max(0, size)
+        if member.is_absolute() or ".." in member.parts or link:
+            unsafe.append(name)
+    if total > 8 * 1024 * 1024 * 1024:
+        raise SecurityError("archive_expansion_limit")
+    if unsafe:
+        raise SecurityError("archive_unsafe_member")
+    return {
+        "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+        "path": str(target), "bytes": target.stat().st_size, "sha256": sha256(target),
+        "archiveMemberCount": len(members), "declaredExpandedBytes": total,
+        "message": "Inspected the artifact hash and archive structure without executing or extracting it.",
+    }
+
+
+def audit():
+    checks = []
+    code, doctor = json_command([str(DOCTOR), "all", "--json"], 120)
+    checks.append({"id": "android-runtime-readiness", "verified": code == 0 and doctor.get("taskVerified") is True})
+    code, registry = json_command([str(REGISTRY), "status"], 30)
+    checks.append({"id": "manifest-registry", "verified": code == 0 and registry.get("taskVerified") is True})
+    code, network = json_command([str(NETDIAG), "route"], 30)
+    checks.append({"id": "read-only-network-route", "verified": code == 0 and network.get("taskVerified") is True})
+    scan = subprocess.run([str(SECRET_SCAN), "--current-only"], cwd=ROOT, capture_output=True, text=True, timeout=180, check=False)
+    checks.append({"id": "repository-secret-scan", "verified": scan.returncode == 0, "summary": (scan.stdout + scan.stderr)[-1000:]})
+    policies = policy_checks()
+    checks.append({"id": "command-policy-sandbox", **policies})
+    modes = sensitive_modes()
+    checks.append({"id": "sensitive-file-modes", **modes})
+    managed = managed_artifacts()
+    checks.append({"id": "managed-artifact-integrity", **managed})
+    verified = all(item.get("verified") is True for item in checks)
+    return {
+        "schemaVersion": 1, "processCompleted": True, "taskVerified": verified,
+        "checks": checks, "failedChecks": [item["id"] for item in checks if item.get("verified") is not True],
+        "message": "Completed the read-only security audit." if verified else "Completed the audit and identified checks that require remediation.",
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Audit runtime security or inspect an artifact without execution.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("audit")
+    artifact_command = commands.add_parser("artifact")
+    artifact_command.add_argument("path")
+    args = parser.parse_args()
+    try:
+        value = audit() if args.command == "audit" else artifact(args.path)
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return 0 if value["taskVerified"] else 5
+    except (SecurityError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired, tarfile.TarError, zipfile.BadZipFile) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Security inspection stopped without executing or trusting the target.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

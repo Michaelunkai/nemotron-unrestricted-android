@@ -1,0 +1,106 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Manage exact reversible battery-optimization exemptions for long agent work."""
+
+import argparse
+import json
+import pathlib
+import subprocess
+import sys
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+RISH = ROOT / "bin" / "rish"
+STATE = ROOT / "runtime" / ".codex" / "automation" / "battery-exemptions.json"
+PACKAGES = ("com.termux", "com.michaelovsky.nemotronunrestricted.isolated")
+
+
+def remote(command):
+    return subprocess.run(
+        [str(RISH), "-c", command], cwd=ROOT, capture_output=True, text=True,
+        timeout=15, check=False,
+    )
+
+
+def current():
+    result = remote("cmd deviceidle whitelist")
+    if result.returncode != 0:
+        raise RuntimeError("deviceidle_read_failed")
+    lines = {line.strip() for line in result.stdout.splitlines() + result.stderr.splitlines()}
+    return {
+        package: any(
+            line == package
+            or line.startswith(f"package:{package}")
+            or line.startswith(f"user,{package},")
+            for line in lines
+        )
+        for package in PACKAGES
+    }
+
+
+def emit(action, before, after, changed):
+    verified = all(after.values()) if action.startswith("Enable") else True
+    print(json.dumps({
+        "schemaVersion": 1, "action": action, "processCompleted": True,
+        "taskVerified": verified, "before": before, "after": after,
+        "changed": changed,
+        "message": "Battery-optimization state was changed only for the exact managed packages and read back."
+        if changed else "Battery-optimization state already matched the requested managed state.",
+    }, sort_keys=True))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-battery",
+        description="Inspect or reversibly manage battery exemptions for Termux and Nemotron.",
+    )
+    parser.add_argument("command", choices=("status", "enable", "disable"))
+    args = parser.parse_args()
+    try:
+        before = current()
+        if args.command == "status":
+            emit("Inspect managed battery-optimization exemptions", before, before, [])
+            return 0
+        if args.command == "enable":
+            STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not STATE.exists():
+                STATE.write_text(json.dumps({"schemaVersion": 1, "before": before}, sort_keys=True) + "\n", encoding="utf-8")
+                STATE.chmod(0o600)
+            changed = []
+            for package, exempt in before.items():
+                if not exempt:
+                    result = remote(f"cmd deviceidle whitelist +{package}")
+                    if result.returncode != 0:
+                        raise RuntimeError(f"enable_failed:{package}")
+                    changed.append(package)
+            after = current()
+            if not all(after.values()):
+                raise RuntimeError("enable_readback_failed")
+            emit("Enable managed battery-optimization exemptions", before, after, changed)
+            return 0
+        if not STATE.is_file() or STATE.is_symlink():
+            raise RuntimeError("managed_baseline_missing")
+        baseline = json.loads(STATE.read_text(encoding="utf-8"))
+        original = baseline.get("before")
+        if not isinstance(original, dict):
+            raise RuntimeError("managed_baseline_invalid")
+        changed = []
+        for package in PACKAGES:
+            if before.get(package) and original.get(package) is False:
+                result = remote(f"cmd deviceidle whitelist -{package}")
+                if result.returncode != 0:
+                    raise RuntimeError(f"disable_failed:{package}")
+                changed.append(package)
+        after = current()
+        STATE.unlink()
+        emit("Disable Nemotron-added battery-optimization exemptions", before, after, changed)
+        return 0
+    except (OSError, RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Battery optimization stopped before claiming success.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

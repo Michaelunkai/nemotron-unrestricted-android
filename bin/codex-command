@@ -1,0 +1,252 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Reusable personal commands backed by the verified task DSL."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+from nemotron_automation import atomic_write
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TASK = ROOT / "bin" / "codex-task"
+EXEC = ROOT / "bin" / "codex-exec"
+STATE = ROOT / "runtime" / ".codex" / "automation" / "commands"
+NAME = re.compile(r"^[a-z][a-z0-9_.-]{1,63}$")
+IDEMPOTENCY = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+
+
+class CommandError(Exception):
+    pass
+
+
+def atomic_json(path, value):
+    atomic_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
+
+
+def command_path(name):
+    return STATE / "definitions" / f"{name}.json"
+
+
+def load_definition(name):
+    try:
+        return json.loads(command_path(name).read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise CommandError("command_not_found") from error
+
+
+def validate_task_file(path):
+    completed = subprocess.run([str(TASK), "dry-run", str(path)], cwd=ROOT, capture_output=True, text=True, timeout=60, check=False)
+    if completed.returncode != 0:
+        raise CommandError("command_task_invalid")
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return payload
+
+
+def task_for_run(definition, run_id):
+    task = json.loads(json.dumps(definition["task"]))
+    task["id"] = run_id
+    return task
+
+
+def run_receipt_path(run_id):
+    return STATE / "runs" / f"{run_id}.json"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Register and run typed idempotent personal commands.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    register = commands.add_parser("register")
+    register.add_argument("name")
+    register.add_argument("task")
+    register.add_argument("--consent", choices=("read", "mutation", "external"), required=True)
+    commands.add_parser("list")
+    plan = commands.add_parser("plan")
+    plan.add_argument("name")
+    run = commands.add_parser("run")
+    run.add_argument("name")
+    run.add_argument("--idempotency-key", required=True)
+    run.add_argument("--confirm-mutation", action="store_true")
+    run.add_argument("--confirm-external", action="store_true")
+    status = commands.add_parser("status")
+    status.add_argument("run_id")
+    cancel = commands.add_parser("cancel")
+    cancel.add_argument("run_id")
+    rollback = commands.add_parser("rollback")
+    rollback.add_argument("run_id")
+    rollback.add_argument("--confirm", action="store_true")
+    args = parser.parse_args()
+    try:
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if args.command == "register":
+            if not NAME.fullmatch(args.name):
+                raise CommandError("command_name_invalid")
+            destination = command_path(args.name)
+            if destination.exists():
+                raise CommandError("command_already_exists")
+            source = pathlib.Path(args.task).expanduser().resolve(strict=True)
+            if source.is_symlink() or source.stat().st_size > 256 * 1024:
+                raise CommandError("command_task_invalid")
+            task = validate_task_file(source)
+            mutation_steps = [step for step in task["steps"] if step.get("mutation")]
+            if args.consent == "read" and mutation_steps:
+                raise CommandError("read_command_contains_mutation")
+            if mutation_steps and any(not step.get("rollback") for step in mutation_steps):
+                raise CommandError("mutation_rollback_required")
+            definition = {
+                "schemaVersion": 1, "name": args.name, "consentClass": args.consent,
+                "task": task, "taskSha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
+            atomic_json(destination, definition)
+            os.chmod(destination, 0o600)
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "definition": {key: definition[key] for key in ("name", "consentClass", "taskSha256")},
+                "message": "Registered the validated personal command and its consent/rollback contract.",
+            }
+        elif args.command == "list":
+            definitions = []
+            for path in sorted((STATE / "definitions").glob("*.json")) if (STATE / "definitions").exists() else []:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                definitions.append({
+                    "name": value["name"], "consentClass": value["consentClass"],
+                    "taskSha256": value["taskSha256"], "stepCount": len(value["task"]["steps"]),
+                })
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "commands": definitions, "message": "Listed personal command metadata without executing a task.",
+            }
+        elif args.command == "plan":
+            definition = load_definition(args.name)
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "name": definition["name"], "consentClass": definition["consentClass"],
+                "steps": [{
+                    "id": step["id"], "purpose": step["purpose"], "mutation": bool(step.get("mutation")),
+                    "requiresConsent": bool(step.get("requiresConsent")), "hasRollback": bool(step.get("rollback")),
+                } for step in definition["task"]["steps"]],
+                "message": "Inspected the exact command steps, consent class, and rollback coverage without execution.",
+            }
+        elif args.command == "run":
+            definition = load_definition(args.name)
+            if not IDEMPOTENCY.fullmatch(args.idempotency_key):
+                raise CommandError("idempotency_key_invalid")
+            if definition["consentClass"] == "mutation" and not args.confirm_mutation:
+                raise CommandError("mutation_confirmation_required")
+            if definition["consentClass"] == "external" and not args.confirm_external:
+                raise CommandError("external_confirmation_required")
+            suffix = hashlib.sha256((args.name + "\0" + args.idempotency_key).encode()).hexdigest()[:20]
+            run_id = f"{args.name}-{suffix}"
+            receipt_path = run_receipt_path(run_id)
+            if receipt_path.exists():
+                prior = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if prior.get("taskVerified") is True:
+                    prior["idempotentReplay"] = True
+                    print(json.dumps(prior, ensure_ascii=False, sort_keys=True))
+                    return 0
+            task = task_for_run(definition, run_id)
+            fd, temporary = tempfile.mkstemp(prefix=".command-", suffix=".json", dir=STATE)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(task, stream)
+                approvals = [step["id"] for step in task["steps"] if step.get("requiresConsent")]
+                argv = [str(TASK), "run", temporary]
+                for approval in approvals:
+                    argv += ["--approve", approval]
+                completed = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=3600, check=False)
+            finally:
+                pathlib.Path(temporary).unlink(missing_ok=True)
+            task_state_path = ROOT / "runtime" / ".codex" / "automation" / "tasks" / f"{run_id}.json"
+            task_state = json.loads(task_state_path.read_text(encoding="utf-8")) if task_state_path.exists() else {}
+            verified = completed.returncode == 0 and task_state.get("status") == "completed"
+            record = {
+                "schemaVersion": 1, "runId": run_id, "name": args.name,
+                "idempotencyKeySha256": hashlib.sha256(args.idempotency_key.encode()).hexdigest(),
+                "taskVerified": verified, "processCompleted": completed.returncode == 0,
+                "status": task_state.get("status"), "completedSteps": task_state.get("completedSteps", []),
+                "technicalEvents": completed.stdout[-16_000:],
+                "message": "Completed the personal command and verified every task step." if verified else "The personal command stopped without a verified completion.",
+            }
+            atomic_json(receipt_path, record)
+            output = record
+        elif args.command in {"status", "cancel"}:
+            if not NAME.fullmatch(args.run_id) and not re.fullmatch(r"^[a-z][a-z0-9_.-]+-[0-9a-f]{20}$", args.run_id):
+                raise CommandError("run_id_invalid")
+            if args.command == "status":
+                path = run_receipt_path(args.run_id)
+                if not path.is_file():
+                    raise CommandError("run_not_found")
+                output = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                completed = subprocess.run([str(TASK), "cancel", args.run_id], cwd=ROOT, capture_output=True, text=True, timeout=30, check=False)
+                if completed.returncode != 0:
+                    raise CommandError("run_cancel_failed")
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "runId": args.run_id, "message": "Requested cancellation through the task process-group controller.",
+                }
+        else:
+            if not args.confirm:
+                raise CommandError("rollback_confirmation_required")
+            record_path = run_receipt_path(args.run_id)
+            if not record_path.is_file():
+                raise CommandError("run_not_found")
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            if record.get("rolledBack"):
+                raise CommandError("run_already_rolled_back")
+            definition = load_definition(record["name"])
+            completed = set(record.get("completedSteps", []))
+            results = []
+            for step in reversed(definition["task"]["steps"]):
+                rollback_spec = step.get("rollback")
+                if step["id"] not in completed or not rollback_spec:
+                    continue
+                request = {
+                    "schemaVersion": 1, "purpose": rollback_spec["purpose"],
+                    "program": rollback_spec["program"], "args": rollback_spec.get("args", []),
+                    "timeoutSeconds": 120, "retries": 0, "retrySafe": False,
+                    "verify": rollback_spec["verify"],
+                }
+                fd, request_name = tempfile.mkstemp(prefix=".rollback-", suffix=".json", dir=STATE)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                        json.dump(request, stream)
+                    completed_process = subprocess.run([str(EXEC), "--request", request_name], cwd=ROOT, capture_output=True, text=True, timeout=180, check=False)
+                    receipt = json.loads(completed_process.stdout)
+                    if completed_process.returncode != 0 or receipt.get("taskVerified") is not True:
+                        raise CommandError("rollback_step_failed:" + step["id"])
+                    results.append({"stepId": step["id"], "taskVerified": True})
+                finally:
+                    pathlib.Path(request_name).unlink(missing_ok=True)
+            record["rolledBack"] = True
+            record["rollbackResults"] = results
+            atomic_json(record_path, record)
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "runId": args.run_id, "rollbackResults": results,
+                "message": "Executed and verified every recorded rollback in reverse step order.",
+            }
+        verified = output.get("taskVerified") is True
+        print(
+            json.dumps(output, ensure_ascii=False, sort_keys=True),
+            file=sys.stdout if verified else sys.stderr,
+        )
+        return 0 if verified else 2
+    except (CommandError, OSError, ValueError, json.JSONDecodeError, yaml.YAMLError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Personal command processing stopped without claiming an unverified action.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

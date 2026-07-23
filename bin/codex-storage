@@ -1,0 +1,130 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Safely manage exact Android shared-storage links."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import sys
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TERMUX_HOME = pathlib.Path("/data/data/com.termux/files/home")
+RUNTIME_HOME = ROOT / "runtime" / "home"
+TARGETS = {
+    "shared": pathlib.Path("/storage/emulated/0"),
+    "downloads": pathlib.Path("/storage/emulated/0/Download"),
+    "pictures": pathlib.Path("/storage/emulated/0/Pictures"),
+    "dcim": pathlib.Path("/storage/emulated/0/DCIM"),
+    "movies": pathlib.Path("/storage/emulated/0/Movies"),
+    "music": pathlib.Path("/storage/emulated/0/Music"),
+}
+
+
+class StorageError(Exception):
+    pass
+
+
+def links(home: pathlib.Path):
+    return {home / "storage" / name: target for name, target in TARGETS.items()}
+
+
+def inspect() -> list[dict]:
+    rows = []
+    for scope, home in (("termux", TERMUX_HOME), ("runtime", RUNTIME_HOME)):
+        for link, target in links(home).items():
+            exists = link.exists() or link.is_symlink()
+            actual = pathlib.Path(os.readlink(link)) if link.is_symlink() else None
+            rows.append({
+                "scope": scope,
+                "name": link.name,
+                "path": str(link),
+                "expectedTarget": str(target),
+                "exists": exists,
+                "isSymlink": link.is_symlink(),
+                "exactTarget": bool(actual == target),
+                "targetReadable": os.access(target, os.R_OK),
+                "targetWritable": os.access(target, os.W_OK),
+            })
+    return rows
+
+
+def receipt(action: str, changed: int = 0) -> dict:
+    rows = inspect()
+    return {
+        "schemaVersion": 1,
+        "action": action,
+        "processCompleted": True,
+        "taskVerified": all(row["exactTarget"] for row in rows),
+        "changed": changed,
+        "links": rows,
+        "message": (
+            "Every standard shared-storage link resolves to its exact Android target."
+            if all(row["exactTarget"] for row in rows)
+            else "Storage state was read exactly; missing or unexpected links remain visible."
+        ),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-storage",
+        description="Inspect, enable, or disable exact reversible Android shared-storage links.",
+    )
+    parser.add_argument("command", choices=("status", "enable", "disable"))
+    args = parser.parse_args()
+    try:
+        if args.command == "status":
+            print(json.dumps(receipt("Inspect Android shared-storage mappings"), sort_keys=True))
+            return 0
+        changed = 0
+        if args.command == "enable":
+            for home in (TERMUX_HOME, RUNTIME_HOME):
+                directory = home / "storage"
+                if directory.exists() and not directory.is_dir():
+                    raise StorageError(f"storage_root_unsafe:{directory}")
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                for link, target in links(home).items():
+                    if not target.is_dir():
+                        raise StorageError(f"target_missing:{target}")
+                    if link.is_symlink():
+                        if pathlib.Path(os.readlink(link)) != target:
+                            raise StorageError(f"unexpected_symlink:{link}")
+                        continue
+                    if link.exists():
+                        raise StorageError(f"existing_path_refused:{link}")
+                    link.symlink_to(target, target_is_directory=True)
+                    changed += 1
+            result = receipt("Enable exact Android shared-storage mappings", changed)
+            if not result["taskVerified"]:
+                raise StorageError("mapping_readback_failed")
+            print(json.dumps(result, sort_keys=True))
+            return 0
+        for home in (TERMUX_HOME, RUNTIME_HOME):
+            for link, target in links(home).items():
+                if not link.exists() and not link.is_symlink():
+                    continue
+                if not link.is_symlink() or pathlib.Path(os.readlink(link)) != target:
+                    raise StorageError(f"non_owned_path_refused:{link}")
+                link.unlink()
+                changed += 1
+        result = receipt("Disable exact Android shared-storage mappings", changed)
+        result["taskVerified"] = all(not row["exists"] for row in result["links"])
+        result["message"] = "Removed only exact managed storage symlinks; shared files were not deleted."
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (OSError, StorageError) as error:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "processCompleted": False,
+            "taskVerified": False,
+            "error": str(error),
+            "message": "Storage mapping stopped without overwriting or deleting shared files.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

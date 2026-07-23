@@ -1,0 +1,245 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Hash-gated CI checks and rollback-capable static deployment."""
+
+import argparse
+import datetime as dt
+import hashlib
+from html.parser import HTMLParser
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT / "workspace"
+STATE = ROOT / "runtime" / ".codex" / "automation" / "pipelines"
+TOOLCHAIN = ROOT / "bin" / "codex-toolchain"
+LANGUAGES = {"python", "node", "shell", "java", "kotlin", "android", "powershell", "static-web"}
+
+
+class PipelineError(Exception):
+    pass
+
+
+def allowed_path(value, must_exist=True):
+    path = pathlib.Path(value).expanduser().resolve(strict=must_exist)
+    workspace = WORKSPACE.resolve()
+    if path != workspace and workspace not in path.parents:
+        raise PipelineError("path_outside_workspace")
+    if path.is_symlink():
+        raise PipelineError("path_symlink_refused")
+    return path
+
+
+def hash_tree(root):
+    digest = hashlib.sha256()
+    files = []
+    for item in sorted(value for value in root.rglob("*") if value.is_file()):
+        if ".git" in item.relative_to(root).parts or item.name == "pipeline.json":
+            continue
+        if item.is_symlink():
+            raise PipelineError("deployment_symlink_refused")
+        relative = item.relative_to(root).as_posix()
+        sha = hashlib.sha256(item.read_bytes()).hexdigest()
+        files.append({"path": relative, "sha256": sha, "bytes": item.stat().st_size})
+        digest.update(relative.encode() + b"\0" + sha.encode() + b"\n")
+        if len(files) > 10_000:
+            raise PipelineError("deployment_file_limit")
+    return digest.hexdigest(), files
+
+
+def load_spec(path):
+    value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or set(value) - {"schemaVersion", "project", "checks", "deploy"}:
+        raise PipelineError("pipeline_schema_invalid")
+    if value.get("schemaVersion") != 1:
+        raise PipelineError("pipeline_schema_version")
+    project = allowed_path(value.get("project"))
+    checks = value.get("checks")
+    if not isinstance(checks, list) or not 1 <= len(checks) <= 16:
+        raise PipelineError("pipeline_checks_invalid")
+    languages = []
+    for check in checks:
+        if not isinstance(check, dict) or set(check) != {"language"} or check["language"] not in LANGUAGES:
+            raise PipelineError("pipeline_check_invalid")
+        languages.append(check["language"])
+    deploy = value.get("deploy")
+    normalized_deploy = None
+    if deploy is not None:
+        if not isinstance(deploy, dict) or set(deploy) != {"type", "source", "target"}:
+            raise PipelineError("deployment_schema_invalid")
+        if deploy["type"] != "static-copy":
+            raise PipelineError("deployment_type_unsupported")
+        source = allowed_path(str(project / deploy["source"]))
+        target = allowed_path(deploy["target"], must_exist=False)
+        if source == target or source in target.parents or target in source.parents:
+            raise PipelineError("deployment_path_overlap")
+        normalized_deploy = {"type": "static-copy", "source": str(source), "target": str(target)}
+    return {"schemaVersion": 1, "project": str(project), "languages": languages, "deploy": normalized_deploy}
+
+
+def plan_hash(plan):
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".partial")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def validate_static(source):
+    entry = source / "index.html"
+    if not entry.is_file() or entry.is_symlink():
+        raise PipelineError("static_entry_missing")
+    parser = HTMLParser()
+    parser.feed(entry.read_text(encoding="utf-8"))
+    parser.close()
+
+
+def run_checks(plan):
+    evidence = []
+    for language in plan["languages"]:
+        completed = subprocess.run(
+            [str(TOOLCHAIN), "verify", plan["project"], "--language", language],
+            cwd=ROOT, capture_output=True, text=True, timeout=300, check=False,
+        )
+        try:
+            receipt = json.loads(completed.stdout if completed.returncode == 0 else completed.stderr)
+        except json.JSONDecodeError as error:
+            raise PipelineError("check_receipt_invalid") from error
+        if completed.returncode != 0 or receipt.get("taskVerified") is not True:
+            raise PipelineError("check_failed:" + language)
+        evidence.append({"language": language, "receipt": receipt})
+    return evidence
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Plan/run verified CI and rollback-capable static deployment.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    plan_command = commands.add_parser("plan")
+    plan_command.add_argument("spec")
+    run = commands.add_parser("run")
+    run.add_argument("spec")
+    run.add_argument("--plan-sha256", required=True)
+    rollback = commands.add_parser("rollback")
+    rollback.add_argument("receipt")
+    args = parser.parse_args()
+    try:
+        if args.command in {"plan", "run"}:
+            plan = load_spec(args.spec)
+            sha = plan_hash(plan)
+            if args.command == "plan":
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "dryRun": True, "plan": plan, "planSha256": sha,
+                    "message": "Validated the CI checks and deployment paths without executing or changing them.",
+                }
+            else:
+                if args.plan_sha256 != sha:
+                    raise PipelineError("plan_hash_mismatch")
+                events = ["Validated the exact hash-bound pipeline plan."]
+                checks = run_checks(plan)
+                events.extend(f"Verified the {item['language']} project check." for item in checks)
+                deployment = None
+                if plan["deploy"]:
+                    source = pathlib.Path(plan["deploy"]["source"])
+                    target = pathlib.Path(plan["deploy"]["target"])
+                    validate_static(source)
+                    source_hash, source_files = hash_tree(source)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    run_id = uuid.uuid4().hex
+                    backup = None
+                    if target.exists():
+                        if not target.is_dir() or target.is_symlink():
+                            raise PipelineError("deployment_target_invalid")
+                        backup = STATE / "backups" / run_id
+                        shutil.copytree(target, backup, symlinks=False)
+                    staging = pathlib.Path(tempfile.mkdtemp(prefix=".deploy-", dir=target.parent))
+                    try:
+                        shutil.copytree(
+                            source, staging, dirs_exist_ok=True, symlinks=False,
+                            ignore=shutil.ignore_patterns(".git", "pipeline.json"),
+                        )
+                        staged_hash, _ = hash_tree(staging)
+                        if staged_hash != source_hash:
+                            raise PipelineError("deployment_staging_mismatch")
+                        previous = target.with_name(target.name + ".previous-" + run_id)
+                        if target.exists():
+                            os.replace(target, previous)
+                        os.replace(staging, target)
+                        if previous.exists():
+                            shutil.rmtree(previous)
+                    finally:
+                        if staging.exists():
+                            shutil.rmtree(staging)
+                    target_hash, target_files = hash_tree(target)
+                    if target_hash != source_hash or target_files != source_files:
+                        raise PipelineError("deployment_readback_mismatch")
+                    deployment = {
+                        "type": "static-copy", "source": str(source), "target": str(target),
+                        "treeSha256": target_hash, "files": target_files,
+                        "backup": str(backup) if backup else None,
+                    }
+                    events.append("Atomically deployed the static site and verified its complete target tree.")
+                receipt_id = uuid.uuid4().hex
+                record = {
+                    "schemaVersion": 1, "id": receipt_id, "planSha256": sha,
+                    "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "checks": checks, "deployment": deployment, "events": events,
+                }
+                receipt_path = STATE / f"{receipt_id}.json"
+                atomic_json(receipt_path, record)
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "receipt": str(receipt_path), "record": record,
+                    "message": "Completed every CI gate and independently verified the deployment target.",
+                }
+        else:
+            receipt = pathlib.Path(args.receipt).expanduser().resolve(strict=True)
+            if receipt.parent != STATE.resolve() or receipt.suffix != ".json":
+                raise PipelineError("receipt_outside_state")
+            record = json.loads(receipt.read_text(encoding="utf-8"))
+            deployment = record.get("deployment")
+            if not deployment:
+                raise PipelineError("deployment_not_present")
+            target = pathlib.Path(deployment["target"])
+            current_hash, current_files = hash_tree(target)
+            if current_hash != deployment["treeSha256"] or current_files != deployment["files"]:
+                raise PipelineError("deployment_changed_since_run")
+            backup = pathlib.Path(deployment["backup"]) if deployment.get("backup") else None
+            temporary = target.with_name(target.name + ".rollback-" + record["id"])
+            os.replace(target, temporary)
+            try:
+                if backup:
+                    shutil.copytree(backup, target, symlinks=False)
+                shutil.rmtree(temporary)
+            except Exception:
+                if not target.exists() and temporary.exists():
+                    os.replace(temporary, target)
+                raise
+            record["rolledBackAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            atomic_json(receipt, record)
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "target": str(target), "restoredPrevious": bool(backup),
+                "message": "Rolled back only the unchanged verified deployment target.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (PipelineError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "The pipeline stopped without claiming an unverified check or deployment.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

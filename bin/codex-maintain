@@ -1,0 +1,336 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Plan and optionally apply rollback-aware Termux maintenance."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE = ROOT / "runtime" / ".codex" / "maintenance"
+ALLOWED_PLAN_ROOTS = (ROOT / "workspace", STATE)
+APT = pathlib.Path(os.environ.get("NEMOTRON_APT_GET", "/data/data/com.termux/files/usr/bin/apt-get"))
+DPKG_QUERY = pathlib.Path("/data/data/com.termux/files/usr/bin/dpkg-query")
+DOCTOR = ROOT / "bin" / "codex-doctor"
+MAX_PLAN_AGE_SECONDS = 24 * 60 * 60
+
+
+class MaintenanceError(Exception):
+    pass
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def digest(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run(argv: list[str], timeout: int, env: dict[str, str] | None = None) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env or os.environ,
+        )
+        return {
+            "exitCode": result.returncode,
+            "stdout": result.stdout[-20_000:],
+            "stderr": result.stderr[-20_000:],
+            "latencyMs": round((time.monotonic() - started) * 1000, 1),
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {
+            "exitCode": None,
+            "stdout": "",
+            "stderr": str(error),
+            "latencyMs": round((time.monotonic() - started) * 1000, 1),
+        }
+
+
+def doctor_freshness() -> dict[str, Any]:
+    result = run([str(DOCTOR), "freshness", "--json"], 30)
+    if result["exitCode"] != 0:
+        raise MaintenanceError(f"freshness_check_failed: {result['stderr']}")
+    try:
+        return json.loads(result["stdout"])
+    except json.JSONDecodeError as error:
+        raise MaintenanceError("freshness_receipt_invalid") from error
+
+
+def package_snapshot() -> list[dict[str, str]]:
+    result = run([str(DPKG_QUERY), "-W", "-f=${binary:Package}\t${Version}\n"], 30)
+    if result["exitCode"] != 0:
+        raise MaintenanceError("package_snapshot_failed")
+    packages = []
+    for line in result["stdout"].splitlines():
+        if "\t" in line:
+            name, version = line.split("\t", 1)
+            packages.append({"name": name, "version": version})
+    return sorted(packages, key=lambda row: row["name"])
+
+
+def plan_payload() -> dict[str, Any]:
+    freshness = doctor_freshness()["freshness"]
+    return {
+        "schemaVersion": 1,
+        "kind": "nemotron-termux-maintenance-plan",
+        "createdAt": utc_now(),
+        "createdEpoch": int(time.time()),
+        "packageIndexRefreshed": False,
+        "upgradableFromCurrentIndex": freshness["upgradableFromCurrentIndex"],
+        "beforePackages": package_snapshot(),
+        "steps": [
+            {
+                "action": "refresh-package-index",
+                "argv": [str(APT), "update"],
+                "network": True,
+                "mutation": True,
+            },
+            {
+                "action": "simulate-no-removal-upgrade",
+                "argv": [str(APT), "-s", "--no-remove", "upgrade"],
+                "network": False,
+                "mutation": False,
+            },
+            {
+                "action": "apply-no-removal-upgrade",
+                "argv": [str(APT), "-y", "--no-remove", "upgrade"],
+                "network": True,
+                "mutation": True,
+            },
+            {
+                "action": "post-upgrade-readiness",
+                "argv": [str(DOCTOR), "all", "--versions", "--json"],
+                "network": False,
+                "mutation": False,
+            },
+        ],
+        "safety": {
+            "requiresExplicitYes": True,
+            "requiresExactPlanSha256": True,
+            "maximumPlanAgeSeconds": MAX_PLAN_AGE_SECONDS,
+            "refusesPackageRemoval": True,
+            "serializesApply": True,
+            "backsUpDpkgState": True,
+            "note": (
+                "Package-manager state is backed up for diagnosis and version comparison. "
+                "It is not a promise that every upstream package can be downgraded."
+            ),
+        },
+    }
+
+
+def allowed_plan(path: pathlib.Path) -> pathlib.Path:
+    resolved = path.resolve(strict=True)
+    if not any(resolved == root.resolve() or root.resolve() in resolved.parents for root in ALLOWED_PLAN_ROOTS):
+        raise MaintenanceError("plan_path_outside_isolated_roots")
+    if resolved.is_symlink() or not resolved.is_file():
+        raise MaintenanceError("plan_path_invalid")
+    return resolved
+
+
+def write_atomic(path: pathlib.Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(data)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def log_event(event: dict[str, Any]) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    log = STATE / "maintenance.jsonl"
+    with log.open("a", encoding="utf-8") as destination:
+        destination.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        destination.flush()
+        os.fsync(destination.fileno())
+    os.chmod(log, 0o600)
+
+
+def backup_state(plan_sha: str, packages: list[dict[str, str]]) -> pathlib.Path:
+    backup = STATE / "backups" / f"{int(time.time())}-{plan_sha[:12]}"
+    backup.mkdir(parents=True, mode=0o700)
+    write_atomic(backup / "packages-before.json", json.dumps(packages, indent=2).encode())
+    for source in (
+        pathlib.Path("/data/data/com.termux/files/usr/var/lib/dpkg/status"),
+        pathlib.Path("/data/data/com.termux/files/usr/etc/apt/sources.list"),
+    ):
+        if source.is_file():
+            destination = backup / source.name
+            shutil.copy2(source, destination)
+            os.chmod(destination, 0o600)
+    manifest = []
+    for path in sorted(backup.iterdir()):
+        if path.is_file():
+            manifest.append({"file": path.name, "sha256": digest(path), "bytes": path.stat().st_size})
+    write_atomic(backup / "manifest.json", json.dumps(manifest, indent=2).encode())
+    return backup
+
+
+def validate_plan(path: pathlib.Path, expected_sha: str) -> tuple[dict[str, Any], str]:
+    actual = digest(path)
+    if expected_sha.lower() != actual:
+        raise MaintenanceError("plan_sha256_mismatch")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise MaintenanceError("plan_json_invalid") from error
+    if payload.get("schemaVersion") != 1 or payload.get("kind") != "nemotron-termux-maintenance-plan":
+        raise MaintenanceError("plan_schema_invalid")
+    created = payload.get("createdEpoch")
+    if not isinstance(created, int) or created > time.time() + 60 or time.time() - created > MAX_PLAN_AGE_SECONDS:
+        raise MaintenanceError("plan_expired")
+    expected_actions = [
+        "refresh-package-index",
+        "simulate-no-removal-upgrade",
+        "apply-no-removal-upgrade",
+        "post-upgrade-readiness",
+    ]
+    if [step.get("action") for step in payload.get("steps", [])] != expected_actions:
+        raise MaintenanceError("plan_steps_invalid")
+    return payload, actual
+
+
+def simulation_refuses_removal(output: str) -> bool:
+    lowered = output.lower()
+    removal_markers = ("remv ", "will be removed", "packages to remove")
+    return any(marker in lowered for marker in removal_markers)
+
+
+def apply_plan(path: pathlib.Path, expected_sha: str) -> dict[str, Any]:
+    payload, plan_sha = validate_plan(path, expected_sha)
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE / "apply.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise MaintenanceError("maintenance_already_running") from error
+        before = package_snapshot()
+        backup = backup_state(plan_sha, before)
+        receipts = []
+        log_event({"at": utc_now(), "event": "maintenance-started", "planSha256": plan_sha, "backup": str(backup)})
+        for step in payload["steps"]:
+            action = step["action"]
+            timeout = 1800 if step["mutation"] else 300
+            receipt = run(step["argv"], timeout)
+            receipts.append({
+                "action": action,
+                "exitCode": receipt["exitCode"],
+                "latencyMs": receipt["latencyMs"],
+                "stdoutTail": receipt["stdout"][-4000:],
+                "stderrTail": receipt["stderr"][-4000:],
+            })
+            if receipt["exitCode"] != 0:
+                log_event({"at": utc_now(), "event": "maintenance-failed", "action": action, "exitCode": receipt["exitCode"]})
+                raise MaintenanceError(f"{action}_failed")
+            if action == "simulate-no-removal-upgrade" and simulation_refuses_removal(receipt["stdout"] + receipt["stderr"]):
+                log_event({"at": utc_now(), "event": "maintenance-refused-removal"})
+                raise MaintenanceError("simulation_proposed_package_removal")
+        after = package_snapshot()
+        result = {
+            "schemaVersion": 1,
+            "action": "Apply the exact guarded Termux maintenance plan",
+            "processCompleted": True,
+            "taskVerified": True,
+            "planSha256": plan_sha,
+            "backup": str(backup),
+            "beforePackageCount": len(before),
+            "afterPackageCount": len(after),
+            "changedPackages": [
+                {"name": row["name"], "before": dict((item["name"], item["version"]) for item in before).get(row["name"]), "after": row["version"]}
+                for row in after
+                if dict((item["name"], item["version"]) for item in before).get(row["name"]) != row["version"]
+            ],
+            "steps": receipts,
+            "message": "The guarded no-removal maintenance plan completed and post-upgrade readiness passed.",
+            "nextAction": "Retain the backup and verify representative app workflows before pruning any maintenance evidence.",
+        }
+        log_event({"at": utc_now(), "event": "maintenance-completed", "planSha256": plan_sha, "changedPackageCount": len(result["changedPackages"])})
+        return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-maintain",
+        description="Check, plan, or explicitly apply rollback-aware Termux maintenance.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("check", help="Read current local freshness evidence without mutation.")
+    plan_parser = subparsers.add_parser("plan", help="Create a hashable no-removal maintenance plan.")
+    plan_parser.add_argument("--output", required=True)
+    apply_parser = subparsers.add_parser("apply", help="Apply one exact fresh plan after explicit confirmation.")
+    apply_parser.add_argument("--plan", required=True)
+    apply_parser.add_argument("--confirm-sha256", required=True)
+    apply_parser.add_argument("--yes", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "check":
+            print(json.dumps(doctor_freshness(), ensure_ascii=False, sort_keys=True))
+            return 0
+        if args.command == "plan":
+            output = pathlib.Path(args.output)
+            if not output.is_absolute():
+                output = ROOT / "workspace" / output
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if not any(output.resolve().parent == root.resolve() or root.resolve() in output.resolve().parents for root in ALLOWED_PLAN_ROOTS):
+                raise MaintenanceError("output_path_outside_isolated_roots")
+            if output.exists():
+                raise MaintenanceError("output_exists")
+            write_atomic(output, (json.dumps(plan_payload(), ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+            print(json.dumps({
+                "schemaVersion": 1,
+                "action": "Create a guarded Termux maintenance plan",
+                "processCompleted": True,
+                "taskVerified": True,
+                "plan": str(output),
+                "sha256": digest(output),
+                "message": "Created the maintenance plan without refreshing or changing packages.",
+                "nextAction": "Review the exact plan and use apply with --yes and its SHA-256 only when an upgrade is explicitly authorized.",
+            }, sort_keys=True))
+            return 0
+        if not args.yes:
+            raise MaintenanceError("explicit_yes_required")
+        result = apply_plan(allowed_plan(pathlib.Path(args.plan)), args.confirm_sha256.lower())
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    except MaintenanceError as error:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "processCompleted": False,
+            "taskVerified": False,
+            "error": str(error),
+            "message": "Maintenance stopped safely before claiming completion.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

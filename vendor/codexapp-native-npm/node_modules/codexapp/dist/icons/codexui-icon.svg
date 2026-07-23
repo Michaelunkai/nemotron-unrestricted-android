@@ -1,0 +1,55 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="background" cx="30%" cy="20%" r="94%">
+      <stop offset="0" stop-color="#263C78"/>
+      <stop offset="0.38" stop-color="#10183D"/>
+      <stop offset="0.74" stop-color="#080D24"/>
+      <stop offset="1" stop-color="#03050E"/>
+    </radialGradient>
+    <linearGradient id="orbit" x1="88" y1="96" x2="432" y2="416" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D7FF75"/>
+      <stop offset="0.42" stop-color="#62F6D0"/>
+      <stop offset="0.72" stop-color="#36C8FF"/>
+      <stop offset="1" stop-color="#8B7CFF"/>
+    </linearGradient>
+    <linearGradient id="core" x1="168" y1="150" x2="350" y2="370" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#18354A"/>
+      <stop offset="0.5" stop-color="#0B1B31"/>
+      <stop offset="1" stop-color="#060C1C"/>
+    </linearGradient>
+    <linearGradient id="monogram" x1="198" y1="190" x2="322" y2="326" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#E9FFF6"/>
+      <stop offset="1" stop-color="#9BFFE7"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="9" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#background)"/>
+  <g fill="#B6D8FF" opacity="0.35">
+    <circle cx="121" cy="132" r="3"/><circle cx="390" cy="116" r="2.5"/>
+    <circle cx="421" cy="354" r="3"/><circle cx="108" cy="386" r="2"/>
+  </g>
+  <circle cx="256" cy="256" r="177" fill="none" stroke="#152F4B" stroke-width="26"/>
+  <circle cx="256" cy="256" r="177" fill="none" stroke="url(#orbit)" stroke-width="13" opacity="0.98"/>
+  <path d="M104 318C151 405 283 438 375 368C437 321 441 219 381 154" fill="none" stroke="#6FF7D3" stroke-width="5" stroke-linecap="round" opacity="0.44"/>
+  <path d="M132 145C205 80 324 84 391 158" fill="none" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" opacity="0.26"/>
+  <path d="M151 256L203 164H309L361 256L309 348H203L151 256Z" fill="url(#core)" stroke="#182F49" stroke-width="20" stroke-linejoin="round"/>
+  <path d="M151 256L203 164H309L361 256L309 348H203L151 256Z" fill="none" stroke="url(#orbit)" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M207 316V196L305 316V196" fill="none" stroke="url(#monogram)" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M207 196L305 316" stroke="#CFFF70" stroke-width="9" stroke-linecap="round"/>
+  <g filter="url(#glow)">
+    <circle cx="256" cy="79" r="13" fill="#D7FF75"/>
+    <circle cx="433" cy="256" r="13" fill="#52EED0"/>
+    <circle cx="256" cy="433" r="13" fill="#36C8FF"/>
+    <circle cx="79" cy="256" r="13" fill="#9C8CFF"/>
+  </g>
+  <g fill="none" stroke="#F4FFF9" stroke-width="7" stroke-linecap="round" opacity="0.92">
+    <path d="M256 102V126"/><path d="M410 256H386"/>
+    <path d="M256 410V386"/><path d="M102 256H126"/>
+  </g>
+  <path d="M386 92V122M371 107H401" stroke="#D7FF75" stroke-width="7" stroke-linecap="round"/>
+  <path d="M386 98L386 116M377 107H395" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+</svg>

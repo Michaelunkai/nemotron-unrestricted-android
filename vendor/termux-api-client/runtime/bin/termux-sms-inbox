@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/home/nvidia-isolated-app/vendor/termux-api-client/runtime/bin/sh
+
+echo "termux-sms-inbox: This script has been replaced by termux-sms-list."
+exit 1

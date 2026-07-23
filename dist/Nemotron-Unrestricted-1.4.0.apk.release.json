@@ -1,0 +1,10 @@
+{
+  "bytes": 292402,
+  "name": "Nemotron-Unrestricted-1.4.0.apk",
+  "package": "com.michaelovsky.nemotronunrestricted.isolated",
+  "schemaVersion": 1,
+  "sha256": "4e3aa0c48e945221167ee8314c29813a31112b756a00e40b9b188804b5f9ac42",
+  "signatureVerified": true,
+  "signerSha256": "f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f",
+  "version": "1.4.0"
+}
