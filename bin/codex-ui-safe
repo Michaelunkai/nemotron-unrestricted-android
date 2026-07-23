@@ -82,7 +82,7 @@ def snapshot(package):
         f"uiautomator dump {shlex.quote(remote)} >/dev/null && "
         f"cp {shlex.quote(remote)} {shlex.quote(str(local))} && "
         f"chmod 600 {shlex.quote(str(local))}; __ui_status=$?; "
-        f"rm -f {shlex.quote(remote)}; exit $__ui_status"
+        f"rm -f {shlex.quote(remote)}; test \"$__ui_status\" -eq 0"
     )
     try:
         read_rish(command)

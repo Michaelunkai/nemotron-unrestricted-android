@@ -125,6 +125,7 @@ class UiSafeTests(unittest.TestCase):
             self.assertTrue(receipt["taskVerified"])
             self.assertTrue(receipt["events"][0]["postconditionVerified"])
             self.assertIn("input tap 60 50", calls)
+            self.assertFalse(any("exit $__ui_status" in command for command in calls))
 
 
 if __name__ == "__main__":
