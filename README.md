@@ -1,17 +1,17 @@
 # Nemotron Unrestricted for Android
 
-The current release is v1.8.0/code 9 at `dist/Nemotron-Unrestricted-1.8.0.apk`, SHA-256 `7677469155c588b8b5a474dc57e8e9d4dedf93b895749256bbe35d2f277722bf`. It preserves the completed UI/runtime recovery, model switching, background watchdog, completion sound, PC/network routes, and same-session verified gallery rendering while adding factual 105-second progress heartbeats, verified trip packs and Android handoffs, semantic UI target ranking, permission readiness reporting, broader polyglot scaffolds, and receipt-backed deployment preflights.
+The current release is v1.9.0/code 10 at `dist/Nemotron-Unrestricted-1.9.0.apk`, SHA-256 `edf81d2ce9a6caaf302b3872fd5f4d35d13e4fa0b4f8456eea7d64f7b8bdeb2f`. It preserves the completed UI/runtime recovery, exact model/effort switching, background watchdog, three-second completion sound, PC/network routes, and same-session verified image rendering while adding hash-verified large Android readbacks, decoded PNG/XML UI evidence, safer semantic exploration, Android 23–36 MediaStore compatibility, and offline English gallery OCR/search.
 
-Release acceptance passed 374 path-independent automated tests, source validation, four off-device 945×2048 UI goldens, the progress and executable gallery-frontend harnesses, source and signed-APK secret scans, two byte-identical builds, and package/version/signature checks. Final public-download, in-place-install, state-preservation, live Android, private-WebView, gallery, background, and network proofs are recorded in `NEXT_SESSION_MASTER_HANDOFF.md`.
+Release acceptance passed 384 path-independent automated tests, source validation, four off-device 945×2048 UI goldens, the progress and executable gallery-frontend harnesses, source and signed-APK secret scans, two byte-identical builds, and package/version/signature checks. Final public-download, in-place-install, state-preservation, live Android, private-WebView, gallery, background, and network proofs are recorded in `NEXT_SESSION_MASTER_HANDOFF.md`.
 
 Nemotron Unrestricted is an independent Android launcher and Termux-hosted agent workspace for OpenRouter models. The local proxy adds no prompt/response content classifier; it provides OpenAI-compatible routing, bounded retries, tool-schema repair, and metadata-only auditing. Provider behavior, account access, Android permissions, target authorization, and hardware limits still apply.
 
 ## Download the Android APK
 
-The public source repository is [Michaelunkai/nemotron-unrestricted-android](https://github.com/Michaelunkai/nemotron-unrestricted-android). The universal Android 1.8.0 APK is available from the [v1.8.0 release](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.8.0):
+The public source repository is [Michaelunkai/nemotron-unrestricted-android](https://github.com/Michaelunkai/nemotron-unrestricted-android). The universal Android 1.9.0 APK is available from the [v1.9.0 release](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.9.0):
 
-- [Download Nemotron-Unrestricted-1.8.0.apk](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.8.0/Nemotron-Unrestricted-1.8.0.apk)
-- SHA-256: `7677469155c588b8b5a474dc57e8e9d4dedf93b895749256bbe35d2f277722bf`
+- [Download Nemotron-Unrestricted-1.9.0.apk](https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.9.0/Nemotron-Unrestricted-1.9.0.apk)
+- SHA-256: `edf81d2ce9a6caaf302b3872fd5f4d35d13e4fa0b4f8456eea7d64f7b8bdeb2f`
 - Signing certificate SHA-256: `f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f`
 
 Android users can download and install the APK on compatible devices after allowing installation from their chosen browser/file manager. The APK is the launcher and lifecycle manager; full agent operation also requires the Termux-hosted repository/runtime, local credentials, permissions, and—only for exact Dolphin X1—the paired-PC setup described below. Installing the APK alone does not bundle an 85 GB model or bypass Android/provider requirements.
@@ -20,7 +20,7 @@ Android users can download and install the APK on compatible devices after allow
 
 - Android package: `com.michaelovsky.nemotronunrestricted.isolated`
 - Activity: `.MainActivity`
-- Version: 1.8.0 (`versionCode 9`)
+- Version: 1.9.0 (`versionCode 10`)
 - GUI: first free loopback port from 5903
 - Proxy: first free loopback port from 18774
 - Supervisor: first free loopback port from 18775
@@ -52,6 +52,9 @@ Tool-bearing requests continue to use a current zero-price catalog model that ex
 - Receipt-backed trip workspaces with bounded headless research, an itinerary, ICS calendar file, encoded Google Maps handoff, action plan, source metadata, hashes, and change-detecting verification.
 - Resolvable Android map, navigation, waypoint, and calendar intents; semantic UI suggestions rank fresh visible labels/descriptions/resource IDs, exclude password fields, refuse ambiguous close ties, and require a postcondition before mutation.
 - Read-only Android permission readiness reports that distinguish actual grants from capabilities that still require an installed companion, Shizuku route, account, or user-visible Android consent.
+- Hash-verified staged Shizuku readbacks avoid truncating large package, MediaStore, and UI evidence; package permission reports are scoped to Android user 0 and retain fully qualified custom permissions.
+- Android UI screenshots are decoded and dimension-checked as PNG, hierarchy dumps are parsed as XML, and bounded semantic exploration refreshes every snapshot, rejects ambiguous targets, and stops on package drift or repeated screens.
+- MediaStore inventory adapts to Android 23–36 columns, prefers provider-returned confined paths, records generations/pending state where available, and supports resumable offline English OCR search with a private SQLite WAL cache and exact word/line evidence.
 - Twelve dependency-aware scaffold templates including Python, Go, Rust, Java, Kotlin, C17, C++17, Node.js, dependency-free Node full-stack, web, PWA, and Android; toolchain and pipeline syntax checks cover the native additions.
 - Receipt-backed deployment status, plan, and execution for already-authenticated Vercel, Cloudflare Pages, and Netlify CLIs, with an exact tree hash, noninteractive command, HTTPS readback, and truthful external-gate reporting when account authorization is absent.
 - Structured generated-image outputs remain persisted and rendered through the native `imageView` path; a prose claim, filename alone, or inaccessible image URL is never treated as successful image output.
@@ -128,10 +131,10 @@ Install without uninstalling or clearing data. Pin the certificate already insta
 
 ```bash
 EXPECTED_SIGNER_SHA256="$(codex-package inspect com.michaelovsky.nemotronunrestricted.isolated | jq -r .signerSha256)"
-codex-install dist/Nemotron-Unrestricted-1.8.0.apk \
+codex-install dist/Nemotron-Unrestricted-1.9.0.apk \
   --package com.michaelovsky.nemotronunrestricted.isolated \
   --signer "$EXPECTED_SIGNER_SHA256" \
-  --sha256 "7677469155c588b8b5a474dc57e8e9d4dedf93b895749256bbe35d2f277722bf"
+  --sha256 "edf81d2ce9a6caaf302b3872fd5f4d35d13e4fa0b4f8456eea7d64f7b8bdeb2f"
 ```
 
 The maintained personal build uses its existing historical upgrade-compatible certificate. A locally generated public-source build has a different signer and cannot upgrade that personal installation without uninstalling it; uninstalling would remove Android app data and is not part of the supported upgrade workflow.

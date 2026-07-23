@@ -7,10 +7,16 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 
-from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_rish
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    read_rish_staged,
+    run_rish,
+)
 from nemotron_automation import AutomationState
 
 
@@ -18,7 +24,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCTOR = os.environ.get("NEMOTRON_DOCTOR_COMMAND", str(ROOT / "bin" / "codex-doctor"))
 TERMUX_BIN = pathlib.Path("/data/data/com.termux/files/usr/bin")
 SAFE_PROPERTY = re.compile(r"^[\w .,+()/:@-]{0,256}$")
-PERMISSION_ROW = re.compile(r"^\s*(android\.permission\.[A-Z0-9_]+): granted=(true|false)\b")
+PERMISSION_ROW = re.compile(
+    r"^\s*((?:[A-Za-z0-9_]+\.)+permission\.[A-Za-z0-9_.]+): "
+    r"granted=(true|false)\b(?:.*?\buserId=(\d+))?"
+)
 CAPABILITY_PERMISSIONS = {
     "calendar": {"android.permission.READ_CALENDAR", "android.permission.WRITE_CALENDAR"},
     "camera": {"android.permission.CAMERA"},
@@ -69,10 +78,37 @@ def parse_lines(text, prefix):
 
 def parse_permission_grants(text):
     values = {}
+    section = None
+    section_indent = -1
+    current_user = None
     for line in text.splitlines():
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        if section is not None and stripped and indent <= section_indent:
+            section = None
+        user = re.fullmatch(r"User\s+(\d+):.*", stripped)
+        if user:
+            current_user = int(user.group(1))
+            section = None
+            continue
+        if stripped == "install permissions:":
+            section = "install"
+            section_indent = indent
+            continue
+        if stripped == "runtime permissions:":
+            section = "runtime"
+            section_indent = indent
+            continue
         match = PERMISSION_ROW.match(line)
-        if match:
-            values[match.group(1)] = match.group(2) == "true"
+        if match is None or section not in {"install", "runtime"}:
+            continue
+        permission, granted, explicit_user = match.groups()
+        if section == "install":
+            if explicit_user not in {None, "0"}:
+                continue
+        elif current_user != 0:
+            continue
+        values[permission] = granted == "true"
     return values
 
 
@@ -83,18 +119,20 @@ def permission_readiness():
     }
     grants = {}
     for name, package in packages.items():
-        result = run_rish(
-            "dumpsys package " + package
-            + r" | grep -E 'android\.permission\.[A-Z0-9_]+: granted='",
-            require_success=False,
+        readback = read_rish_staged(
+            "dumpsys package " + shlex.quote(package),
+            max_bytes=8 * 1024 * 1024,
         )
-        if result.remote_status not in {0, 1}:
-            raise DeviceError("permission_readback_failed")
-        parsed = parse_permission_grants(result.stdout)
+        parsed = parse_permission_grants(readback.text)
+        if not parsed:
+            raise DeviceError("permission_readback_empty")
         grants[name] = {
             "package": package,
             "granted": sorted(permission for permission, granted in parsed.items() if granted),
             "declaredButNotGranted": sorted(permission for permission, granted in parsed.items() if not granted),
+            "readbackBytes": readback.bytes,
+            "readbackSha256": readback.sha256,
+            "userId": 0,
         }
     termux_granted = set(grants["termux"]["granted"])
     capabilities = {

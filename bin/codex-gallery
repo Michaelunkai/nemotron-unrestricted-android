@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
 import io
 import json
@@ -12,6 +13,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,16 +21,27 @@ import time
 import urllib.error
 import urllib.request
 
-from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_rish
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    read_rish_staged,
+    run_rish,
+)
 
 
 URIS = {
     "image": "content://media/external/images/media",
     "video": "content://media/external/video/media",
 }
-FIELDS = ("_id", "_display_name", "relative_path", "date_added", "date_modified", "mime_type", "_size", "is_trashed")
+FIELDS = (
+    "_id", "_display_name", "_data", "relative_path", "date_added",
+    "date_modified", "generation_modified", "mime_type", "_size", "is_pending",
+    "is_trashed",
+)
 ROW_RE = re.compile(r"(?:^|\n)Row:\s+\d+\s+")
-KEY_RE = re.compile(r"(?:^|, )(_id|_display_name|relative_path|date_added|date_modified|mime_type|_size|is_trashed)=")
+KEY_RE = re.compile(
+    r"(?:^|, )(_id|_display_name|_data|relative_path|date_added|date_modified|generation_modified|mime_type|_size|is_pending|is_trashed)="
+)
 GALLERY_RESULT_SCHEMA = "nemotron.gallery-result.v1"
 GALLERY_RENDER_TYPE = "verified-local-image-grid"
 
@@ -61,8 +74,19 @@ def parser():
         command = sub.add_parser(name)
         command.add_argument("--kind", choices=("image", "video"), required=True)
         command.add_argument("--id", type=int, required=True)
+        if name == "ocr":
+            command.add_argument("--language", default="eng")
+            command.add_argument("--psm", type=int, choices=(3, 6, 11), default=3)
         if name in {"delete", "restore"}:
             command.add_argument("--confirm", required=True)
+    ocr_search = sub.add_parser("ocr-search")
+    ocr_search.add_argument("query")
+    ocr_search.add_argument("--hours", type=int, default=24 * 365)
+    ocr_search.add_argument("--limit", type=int, default=25)
+    ocr_search.add_argument("--offset", type=int, default=0)
+    ocr_search.add_argument("--language", default="eng")
+    ocr_search.add_argument("--psm", type=int, choices=(3, 6, 11), default=11)
+    ocr_search.add_argument("--no-present", action="store_true")
     export = sub.add_parser("export")
     export.add_argument("--kind", choices=("image", "video"), required=True)
     export.add_argument("--id", type=int, required=True)
@@ -83,22 +107,56 @@ def parse_rows(output, kind):
             value = raw[match.end():end].strip().removesuffix(",")
             record[match.group(1)] = None if value == "NULL" else value
         if str(record.get("_id", "")).isdigit():
-            for key in ("_id", "date_added", "date_modified", "_size", "is_trashed"):
+            for key in (
+                "_id", "date_added", "date_modified", "generation_modified",
+                "_size", "is_pending", "is_trashed",
+            ):
                 if str(record.get(key, "")).isdigit():
                     record[key] = int(record[key])
             records.append(record)
     return records
 
 
+def android_media_query_shape(sdk, *, include_trashed=False):
+    if isinstance(sdk, bool) or not isinstance(sdk, int) or not 23 <= sdk <= 100:
+        raise AndroidBridgeError("android_sdk_invalid")
+    fields = [
+        "_id", "_display_name", "_data", "date_added",
+        "date_modified", "mime_type", "_size",
+    ]
+    clauses = []
+    if sdk >= 29:
+        fields.extend(("relative_path", "is_pending"))
+        clauses.append("is_pending=0")
+    if sdk >= 30:
+        fields.extend(("generation_modified", "is_trashed"))
+        if not include_trashed:
+            clauses.insert(0, "is_trashed=0")
+    elif include_trashed:
+        raise AndroidPolicyError("gallery_trash_unsupported")
+    return tuple(fields), " AND ".join(clauses)
+
+
 def query_kind(kind, *, include_trashed=False):
-    projection = ":".join(FIELDS)
-    where = "is_pending=0" if include_trashed else "is_trashed=0 AND is_pending=0"
+    sdk_result = run_rish("getprop ro.build.version.sdk")
+    sdk_values = [
+        int(line.strip()) for line in sdk_result.combined.splitlines()
+        if line.strip().isdigit()
+    ]
+    if len(sdk_values) != 1:
+        raise AndroidBridgeError("android_sdk_invalid")
+    fields, where = android_media_query_shape(
+        sdk_values[0], include_trashed=include_trashed,
+    )
+    projection = ":".join(fields)
     command = (
         f"content query --user 0 --uri {shlex.quote(URIS[kind])} "
-        f"--projection {shlex.quote(projection)} --where {shlex.quote(where)}"
+        f"--projection {shlex.quote(projection)}"
     )
-    result = run_rish(command)
-    return parse_rows(result.stdout, kind)
+    if where:
+        command += f" --where {shlex.quote(where)}"
+    readback = read_rish_staged(command, timeout=90, max_bytes=32 * 1024 * 1024)
+    return parse_rows(readback.text, kind)
 
 
 def selected_kinds(kind):
@@ -135,8 +193,19 @@ def safe_media_path(record):
     name = str(record.get("_display_name") or "")
     if not name or "/" in name or "\\" in name or "\x00" in name:
         return None
-    parts = pathlib.PurePosixPath(relative).parts
-    if not parts or any(part in {"", ".", ".."} for part in parts):
+    data = str(record.get("_data") or "")
+    if data and "\x00" not in data:
+        candidate = pathlib.PurePosixPath(data)
+        if (
+            candidate.is_absolute()
+            and candidate.parts[:4] == ("/", "storage", "emulated", "0")
+            and not any(part in {"", ".", ".."} for part in candidate.parts[1:])
+            and candidate.name == name
+        ):
+            return str(candidate)
+    normalized_relative = "" if relative == "/" else relative.strip("/")
+    parts = pathlib.PurePosixPath(normalized_relative).parts if normalized_relative else ()
+    if any(part in {"", ".", ".."} for part in parts):
         return None
     path = pathlib.PurePosixPath("/storage/emulated/0", *parts, name)
     return str(path) if str(path).startswith("/storage/emulated/0/") else None
@@ -451,6 +520,180 @@ def parse_json_object(text):
     return value if isinstance(value, dict) else None
 
 
+def validate_ocr_language(language):
+    if (
+        not isinstance(language, str)
+        or not language
+        or len(language) > 64
+        or any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,24}", part) for part in language.split("+"))
+    ):
+        raise AndroidPolicyError("gallery_ocr_language")
+    return language
+
+
+def tesseract_languages(executable):
+    completed = subprocess.run(
+        [executable, "--list-langs"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AndroidBridgeError("local_ocr_language_read_failed")
+    return {
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if re.fullmatch(r"[A-Za-z0-9_.-]{1,24}", line.strip())
+    }
+
+
+def parse_tesseract_tsv(output):
+    if not isinstance(output, str) or len(output.encode("utf-8")) > 8 * 1024 * 1024:
+        raise AndroidBridgeError("local_ocr_result_too_large")
+    words = []
+    grouped = {}
+    try:
+        rows = csv.DictReader(io.StringIO(output), delimiter="\t")
+        required = {
+            "level", "block_num", "par_num", "line_num", "left", "top",
+            "width", "height", "conf", "text",
+        }
+        if rows.fieldnames is None or not required <= set(rows.fieldnames):
+            raise AndroidBridgeError("local_ocr_result_invalid")
+        for row in rows:
+            text = str(row.get("text") or "").strip()
+            if row.get("level") != "5" or not text:
+                continue
+            if len(words) >= 20_000:
+                raise AndroidBridgeError("local_ocr_word_limit")
+            confidence = float(row["conf"])
+            left, top = int(row["left"]), int(row["top"])
+            width, height = int(row["width"]), int(row["height"])
+            if confidence < 0 or min(left, top, width, height) < 0:
+                continue
+            word = {
+                "text": text[:500],
+                "confidence": round(confidence, 3),
+                "bounds": [left, top, width, height],
+            }
+            words.append(word)
+            key = (int(row["block_num"]), int(row["par_num"]), int(row["line_num"]))
+            grouped.setdefault(key, []).append(text)
+    except (TypeError, ValueError, KeyError, csv.Error) as error:
+        raise AndroidBridgeError("local_ocr_result_invalid") from error
+    blocks = [" ".join(grouped[key])[:4000] for key in sorted(grouped)]
+    text = "\n".join(blocks)[:100_000]
+    return {"text": text, "blocks": blocks[:1000], "words": words}
+
+
+def local_ocr(path, *, language="eng", psm=3):
+    language = validate_ocr_language(language)
+    if psm not in {3, 6, 11}:
+        raise AndroidPolicyError("gallery_ocr_psm")
+    executable = shutil.which("tesseract")
+    if executable is None:
+        raise AndroidBridgeError("local_ocr_tool_unavailable")
+    available = tesseract_languages(executable)
+    requested = set(language.split("+"))
+    if not requested <= available:
+        raise AndroidBridgeError("local_ocr_language_unavailable")
+    completed = subprocess.run(
+        [executable, str(path), "stdout", "-l", language, "--psm", str(psm), "tsv"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AndroidBridgeError("local_ocr_process_failed")
+    result = parse_tesseract_tsv(completed.stdout)
+    return {
+        **result,
+        "language": language,
+        "engine": "tesseract-local-5",
+        "offline": True,
+        "pageSegmentationMode": psm,
+    }
+
+
+def ocr_cache_path():
+    root = pathlib.Path(__file__).resolve().parents[1] / "workspace" / "gallery-ocr"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root / "ocr-cache.sqlite3"
+
+
+def cached_local_ocr(record, path, *, language, psm):
+    cache = ocr_cache_path()
+    connection = sqlite3.connect(cache, timeout=15)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ocr_cache (
+                media_id INTEGER NOT NULL,
+                generation_modified INTEGER NOT NULL,
+                date_modified INTEGER NOT NULL,
+                media_size INTEGER NOT NULL,
+                language TEXT NOT NULL,
+                psm INTEGER NOT NULL,
+                result_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (
+                    media_id, generation_modified, date_modified,
+                    media_size, language, psm
+                )
+            )
+            """
+        )
+        key = (
+            int(record["_id"]),
+            int(record.get("generation_modified") or 0),
+            int(record.get("date_modified") or 0),
+            int(record.get("_size") or 0),
+            validate_ocr_language(language),
+            int(psm),
+        )
+        row = connection.execute(
+            """
+            SELECT result_json FROM ocr_cache
+            WHERE media_id=? AND generation_modified=? AND date_modified=?
+              AND media_size=? AND language=? AND psm=?
+            """,
+            key,
+        ).fetchone()
+        if row is not None:
+            try:
+                result = json.loads(row[0])
+            except (TypeError, json.JSONDecodeError) as error:
+                raise AndroidBridgeError("local_ocr_cache_invalid") from error
+            if not isinstance(result, dict) or result.get("engine") != "tesseract-local-5":
+                raise AndroidBridgeError("local_ocr_cache_invalid")
+            return {**result, "cacheHit": True}
+        result = local_ocr(path, language=language, psm=psm)
+        serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if len(serialized.encode("utf-8")) > 4 * 1024 * 1024:
+            raise AndroidBridgeError("local_ocr_cache_result_too_large")
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO ocr_cache (
+                media_id, generation_modified, date_modified, media_size,
+                language, psm, result_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (*key, serialized, int(time.time())),
+        )
+        connection.commit()
+        try:
+            cache.chmod(0o600)
+        except OSError:
+            pass
+        return {**result, "cacheHit": False}
+    finally:
+        connection.close()
+
+
 def vision_match(port, query, path):
     prompt = (
         "Compare this image with the user's visual search query. Return JSON only with keys "
@@ -657,11 +900,113 @@ def ocr_action(args):
     if args.kind != "image":
         raise AndroidPolicyError("gallery_ocr_image_only")
     record, path = exact_path_record(args.kind, args.id)
-    project = pathlib.Path(__file__).resolve().parents[1]
-    result = vision_ocr(configured_proxy_port(project), str(path))
+    language = getattr(args, "language", "eng")
+    psm = getattr(args, "psm", 3)
+    try:
+        result = cached_local_ocr(record, path, language=language, psm=psm)
+    except AndroidBridgeError as local_error:
+        project = pathlib.Path(__file__).resolve().parents[1]
+        result = {
+            **vision_ocr(configured_proxy_port(project), str(path)),
+            "engine": "verified-vision-route",
+            "offline": False,
+            "cacheHit": False,
+            "fallbackReason": str(local_error),
+        }
     return {
         "ok": True, "item": record, **result, "verified": True,
         "scope": "visible-text-transcription-only",
+    }
+
+
+def ocr_search_inventory(args):
+    query = args.query.strip()
+    language = validate_ocr_language(args.language)
+    if (
+        not query
+        or len(query) > 300
+        or not 1 <= args.limit <= 100
+        or not 0 <= args.offset <= 10_000_000
+        or not 1 <= args.hours <= 24 * 365 * 10
+        or args.psm not in {3, 6, 11}
+    ):
+        raise AndroidPolicyError("gallery_ocr_search_bounds")
+    threshold = int(time.time()) - args.hours * 3600
+    all_candidates = [
+        record for record in query_kind("image")
+        if int(record.get("date_added") or 0) >= threshold and safe_media_path(record)
+    ]
+    all_candidates.sort(
+        key=lambda record: (int(record.get("date_added") or 0), int(record["_id"])),
+        reverse=True,
+    )
+    candidates = all_candidates[args.offset:args.offset + args.limit]
+    progress(
+        f"found {len(all_candidates)} eligible gallery images; reading visible text from "
+        f"offset {args.offset} through {args.offset + len(candidates)} with offline OCR."
+    )
+    matches, errors = [], []
+    folded = query.casefold()
+    for index, record in enumerate(candidates, 1):
+        path = safe_media_path(record)
+        progress(
+            f"reading visible text from image {index} of {len(candidates)} "
+            f"(MediaStore ID {record['_id']})."
+        )
+        try:
+            result = cached_local_ocr(
+                record, pathlib.Path(path), language=language, psm=args.psm,
+            )
+        except (AndroidBridgeError, AndroidPolicyError, OSError, subprocess.TimeoutExpired) as error:
+            errors.append({"id": record["_id"], "error": str(error)})
+            continue
+        if folded in result["text"].casefold():
+            matches.append({
+                **record,
+                "path": path,
+                "ocrText": result["text"],
+                "ocrLanguage": result["language"],
+                "ocrEngine": result["engine"],
+                "ocrCacheHit": result["cacheHit"],
+            })
+    presentations = [] if args.no_present else presentation_sheets(matches, "OCR matches")
+    consumed = args.offset + len(candidates)
+    has_more = consumed < len(all_candidates)
+    render = gallery_render_receipt(
+        matches, presentations, label=f'Gallery images containing text “{query}”',
+    )
+    verified = not errors and render["verified"]
+    progress(
+        f"found {len(matches)} matching images; {len(errors)} image(s) failed local OCR; "
+        f"created {len(presentations)} presentation sheet(s)."
+    )
+    return {
+        "schema": GALLERY_RESULT_SCHEMA,
+        "ok": not errors,
+        "count": len(matches),
+        "scanned": len(candidates),
+        "items": matches,
+        "errors": errors,
+        "verified": verified,
+        "totalCandidates": len(all_candidates),
+        "offset": args.offset,
+        "hasMore": has_more,
+        "nextOffset": consumed if has_more else None,
+        "language": language,
+        "pageSegmentationMode": args.psm,
+        "engine": "tesseract-local-5",
+        "offline": True,
+        "presentations": presentations,
+        "render": render,
+        "displayMessage": (
+            f"Found {len(matches)} gallery image(s) containing the requested visible text "
+            f"after reading {len(candidates)} image(s) locally."
+        ),
+        "renderInstruction": (
+            "Render every verified render.images[] item inline automatically in the app. "
+            "Continue nextOffset while hasMore is true."
+        ),
+        "scope": "offline-visible-text-search-no-image-upload",
     }
 
 
@@ -817,6 +1162,9 @@ def main():
             return 0
         if args.action == "semantic":
             print(json.dumps(semantic_inventory(args), separators=(",", ":"), sort_keys=True))
+            return 0
+        if args.action == "ocr-search":
+            print(json.dumps(ocr_search_inventory(args), separators=(",", ":"), sort_keys=True))
             return 0
         if args.action == "metadata":
             print(json.dumps(metadata_action(args), separators=(",", ":"), sort_keys=True))

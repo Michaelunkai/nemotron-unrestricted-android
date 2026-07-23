@@ -32,12 +32,22 @@ class DeviceTests(unittest.TestCase):
 
     def test_permission_parser_and_capability_map_are_truthful(self):
         parsed = MODULE["parse_permission_grants"](
-            "  android.permission.CAMERA: granted=true, flags=[ USER_SET ]\n"
-            "  android.permission.RECORD_AUDIO: granted=false, flags=[ USER_SET ]\n"
-            "  unrelated\n"
+            "    install permissions:\n"
+            "      android.permission.INTERNET: granted=true\n"
+            "      android.permission.INTERNET: granted=false, userId=150\n"
+            "    User 0:\n"
+            "      runtime permissions:\n"
+            "        android.permission.CAMERA: granted=true, flags=[ USER_SET ]\n"
+            "        android.permission.RECORD_AUDIO: granted=false, flags=[ USER_SET ]\n"
+            "        com.termux.permission.RUN_COMMAND: granted=true\n"
+            "    User 150:\n"
+            "      runtime permissions:\n"
+            "        android.permission.CAMERA: granted=false\n"
         )
         self.assertTrue(parsed["android.permission.CAMERA"])
         self.assertFalse(parsed["android.permission.RECORD_AUDIO"])
+        self.assertTrue(parsed["android.permission.INTERNET"])
+        self.assertTrue(parsed["com.termux.permission.RUN_COMMAND"])
         self.assertIn("camera", MODULE["CAPABILITY_PERMISSIONS"])
         self.assertIn("android.permission.ACCESS_FINE_LOCATION", MODULE["CAPABILITY_PERMISSIONS"]["location"])
 

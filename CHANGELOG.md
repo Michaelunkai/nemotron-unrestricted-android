@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.0 — 2026-07-23
+
+- Added hash-verified staged Android readbacks so large package, MediaStore, and hierarchy outputs cannot be silently truncated.
+- Added decoded PNG screenshot verification, parsed XML hierarchy receipts, and bounded fresh-snapshot semantic UI exploration.
+- Added Android 23–36 MediaStore query compatibility and provider-path confinement.
+- Added offline English gallery OCR/search with Tesseract, exact word/line evidence, pagination, and a private SQLite WAL cache.
+- Corrected user-0 permission parsing while retaining fully qualified custom Android permissions.
+- Preserved exact model/effort switching, factual English progress, same-session images, background service, three-second completion audio, PC/network automation, and all prior verified workflows.
+
 ## 1.8.0 — 2026-07-23
 
 - Added 105-second factual English progress heartbeats for every active turn.

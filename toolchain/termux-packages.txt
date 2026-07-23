@@ -21,6 +21,7 @@ yara
 apktool
 exiftool
 mediainfo
+tesseract
 python-cryptography
 python-lxml
 golang

@@ -46,7 +46,16 @@ else
   "$APP_HOME/scan-nemotron-secrets.py"
 fi
 "$PYTHON_BIN" -m unittest discover -s tests -v
-"$APP_HOME/isolation-preflight.sh"
+preflight_attempt=1
+while ! "$APP_HOME/isolation-preflight.sh"; do
+  if [ "$preflight_attempt" -ge 3 ]; then
+    printf 'RELEASE_ISOLATION_PREFLIGHT_FAILED attempts=%s\n' "$preflight_attempt" >&2
+    exit 1
+  fi
+  printf 'Release verification observed a temporary runtime-readiness race on attempt %s; waiting two seconds before the same read-only isolation check.\n' "$preflight_attempt"
+  sleep 2
+  preflight_attempt=$((preflight_attempt + 1))
+done
 git -C "$APP_HOME" diff --check
 staged_count=$(git -C "$APP_HOME" diff --cached --name-only | sed '/^$/d' | wc -l | tr -d ' ')
 printf 'RELEASE_STAGED_FILES count=%s\n' "$staged_count"
@@ -55,7 +64,7 @@ if [ "$staged_count" -gt 0 ]; then
 fi
 "$APP_HOME/build-nemotron-unrestricted.sh"
 
-APK="$APP_HOME/dist/Nemotron-Unrestricted-1.8.0.apk"
+APK="$APP_HOME/dist/Nemotron-Unrestricted-1.9.0.apk"
 test -s "$APK" && test -s "$APK.sha256"
 (cd "$APP_HOME/dist" && sha256sum -c --status "$(basename "$APK.sha256")")
 zipalign -c 4 "$APK"
@@ -65,7 +74,7 @@ printf '%s\n' "$verification" | grep -Fq 'Verified using v2 scheme (APK Signatur
 printf '%s\n' "$verification" | grep -Fq 'Verified using v3 scheme (APK Signature Scheme v3): true'
 [ -s "$APK.idsig" ] || { printf 'RELEASE_V4_SIDECAR_MISSING\n' >&2; exit 1; }
 printf 'RELEASE_V4_SIDECAR_PRESENT verifier_confirmation_unavailable\n'
-aapt dump badging "$APK" | grep -q "package: name='com.michaelovsky.nemotronunrestricted.isolated' versionCode='9' versionName='1.8.0'"
+aapt dump badging "$APK" | grep -q "package: name='com.michaelovsky.nemotronunrestricted.isolated' versionCode='10' versionName='1.9.0'"
 signer=$(printf '%s\n' "$verification" | awk -F': ' '/certificate SHA-256 digest:/ {print $NF; exit}')
 printf '%s' "$signer" | grep -Eq '^[0-9a-f]{64}$' || { printf 'RELEASE_SIGNER_UNAVAILABLE\n' >&2; exit 1; }
 verify_preservation

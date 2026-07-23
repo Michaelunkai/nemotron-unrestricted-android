@@ -34,6 +34,20 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(rows[0]["_size"], 70445)
         self.assertEqual(rows[0]["relative_path"], "DCIM/Screenshots/")
 
+    def test_media_query_shape_preserves_android_23_through_36_compatibility(self):
+        fields_23, where_23 = GALLERY.android_media_query_shape(23)
+        self.assertIn("_data", fields_23)
+        self.assertNotIn("relative_path", fields_23)
+        self.assertEqual(where_23, "")
+        fields_29, where_29 = GALLERY.android_media_query_shape(29)
+        self.assertIn("relative_path", fields_29)
+        self.assertEqual(where_29, "is_pending=0")
+        fields_36, where_36 = GALLERY.android_media_query_shape(36)
+        self.assertIn("generation_modified", fields_36)
+        self.assertEqual(where_36, "is_trashed=0 AND is_pending=0")
+        with self.assertRaises(GALLERY.AndroidPolicyError):
+            GALLERY.android_media_query_shape(29, include_trashed=True)
+
     def test_delete_trashes_exact_item_and_returns_restore_contract(self):
         args = types.SimpleNamespace(action="delete", kind="image", id=42, confirm="DELETE_MEDIA_ID_42")
         before = {"_id": 42, "_display_name": "fixture.jpg", "mime_type": "image/jpeg", "is_trashed": 0}
@@ -67,8 +81,25 @@ class GalleryTests(unittest.TestCase):
             GALLERY.safe_media_path({"relative_path": "DCIM/Screenshots/", "_display_name": "shot.jpg"}),
             "/storage/emulated/0/DCIM/Screenshots/shot.jpg",
         )
+        self.assertEqual(
+            GALLERY.safe_media_path({
+                "_data": "/storage/emulated/0/dayflow.png",
+                "relative_path": "/",
+                "_display_name": "dayflow.png",
+            }),
+            "/storage/emulated/0/dayflow.png",
+        )
+        self.assertEqual(
+            GALLERY.safe_media_path({"relative_path": "/", "_display_name": "root-photo.jpg"}),
+            "/storage/emulated/0/root-photo.jpg",
+        )
         self.assertIsNone(GALLERY.safe_media_path({"relative_path": "../private/", "_display_name": "shot.jpg"}))
         self.assertIsNone(GALLERY.safe_media_path({"relative_path": "DCIM/", "_display_name": "../shot.jpg"}))
+        self.assertIsNone(GALLERY.safe_media_path({
+            "_data": "/storage/emulated/0/../private/shot.jpg",
+            "relative_path": "../private/",
+            "_display_name": "shot.jpg",
+        }))
 
     def test_face_inventory_reports_only_local_face_presence(self):
         now = 1_800_000_000
@@ -328,21 +359,78 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(result["metadata"]["EXIF:Orientation"], 1)
         self.assertEqual(run.call_args.args[0][1:4], ["-json", "-G1", "-struct"])
 
-    def test_ocr_uses_verified_vision_route_for_one_exact_image(self):
+    def test_ocr_prefers_verified_offline_local_route_for_one_exact_image(self):
         record = {
             "_id": 7, "_display_name": "receipt.jpg", "relative_path": "DCIM/Camera/",
             "mime_type": "image/jpeg",
         }
-        args = types.SimpleNamespace(kind="image", id=7)
+        args = types.SimpleNamespace(kind="image", id=7, language="eng", psm=3)
         with mock.patch.object(GALLERY, "exact_path_record", return_value=(record, pathlib.Path("/tmp/receipt.jpg"))), \
-             mock.patch.object(GALLERY, "configured_proxy_port", return_value=18776), \
-             mock.patch.object(GALLERY, "vision_ocr", return_value={
-                 "text": "TOTAL 12.50", "language": "en", "blocks": ["TOTAL 12.50"],
-             }):
+             mock.patch.object(GALLERY, "cached_local_ocr", return_value={
+                 "text": "TOTAL 12.50", "language": "eng", "blocks": ["TOTAL 12.50"],
+                 "words": [], "engine": "tesseract-local-5", "offline": True,
+                 "cacheHit": False, "pageSegmentationMode": 3,
+             }), \
+             mock.patch.object(GALLERY, "vision_ocr") as remote:
             result = GALLERY.ocr_action(args)
         self.assertTrue(result["verified"])
         self.assertEqual(result["text"], "TOTAL 12.50")
+        self.assertTrue(result["offline"])
+        self.assertEqual(result["engine"], "tesseract-local-5")
         self.assertEqual(result["scope"], "visible-text-transcription-only")
+        remote.assert_not_called()
+
+    def test_tesseract_tsv_parser_preserves_confidence_bounds_and_reading_order(self):
+        tsv = (
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+            "5\t1\t1\t1\t1\t1\t10\t20\t50\t18\t96.5\tTOTAL\n"
+            "5\t1\t1\t1\t1\t2\t70\t20\t40\t18\t94.0\t12.50\n"
+            "5\t1\t1\t1\t2\t1\t10\t50\t30\t18\t91.0\tPAID\n"
+        )
+        result = GALLERY.parse_tesseract_tsv(tsv)
+        self.assertEqual(result["text"], "TOTAL 12.50\nPAID")
+        self.assertEqual(result["words"][0]["bounds"], [10, 20, 50, 18])
+        self.assertEqual(result["words"][0]["confidence"], 96.5)
+
+    def test_ocr_search_is_offline_paginated_cached_and_renderable(self):
+        now = 1_800_000_000
+        records = [
+            {
+                "_id": index, "_display_name": f"{index}.jpg", "_data": f"/storage/emulated/0/{index}.jpg",
+                "relative_path": "/", "date_added": now - index, "date_modified": 1,
+                "generation_modified": 2, "_size": 100, "mime_type": "image/jpeg",
+            }
+            for index in range(1, 4)
+        ]
+        args = types.SimpleNamespace(
+            query="invoice", hours=24, limit=2, offset=0, language="eng",
+            psm=11, no_present=False,
+        )
+        results = [
+            {
+                "text": "Invoice 123", "language": "eng", "engine": "tesseract-local-5",
+                "cacheHit": False,
+            },
+            {
+                "text": "holiday", "language": "eng", "engine": "tesseract-local-5",
+                "cacheHit": True,
+            },
+        ]
+        sheets = [{
+            "path": "/tmp/ocr-sheet.jpg", "sha256": "a" * 64, "bytes": 10,
+            "itemCount": 1, "page": 1, "verified": True,
+        }]
+        with mock.patch.object(GALLERY, "query_kind", return_value=records), \
+             mock.patch.object(GALLERY.time, "time", return_value=now), \
+             mock.patch.object(GALLERY, "cached_local_ocr", side_effect=results), \
+             mock.patch.object(GALLERY, "presentation_sheets", return_value=sheets):
+            result = GALLERY.ocr_search_inventory(args)
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["offline"])
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["nextOffset"], 2)
+        self.assertTrue(result["hasMore"])
+        self.assertEqual(result["render"]["images"][0]["mediaId"], 1)
 
     def test_export_preserves_original_and_verifies_new_output(self):
         record = {

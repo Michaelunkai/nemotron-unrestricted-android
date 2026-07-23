@@ -102,6 +102,54 @@ class UiSafeTests(unittest.TestCase):
             MODULE["validate_spec"]([{
                 "action": "click", "fallbackCoordinates": [-1, 2], "after": {"text": "Done"},
             }])
+        validated = MODULE["validate_spec"]([
+            {
+                "action": "long-click", "selector": {"text": "Item"},
+                "durationMs": 900, "after": {"text": "Context menu"},
+            },
+            {"action": "wait", "after": {"text": "Finished"}, "retries": 3},
+        ])
+        self.assertEqual([step["action"] for step in validated], ["long-click", "wait"])
+
+    def test_explore_scrolls_bounded_screens_and_returns_one_unambiguous_target(self):
+        first = MODULE["ET"].fromstring(
+            '<hierarchy><node text="Settings" enabled="true" bounds="[0,0][20,20]"/></hierarchy>'
+        )
+        second_source = (
+            '<hierarchy><node text="Done" resource-id="app:id/save" clickable="true" '
+            'enabled="true" bounds="[10,20][110,80]"/></hierarchy>'
+        )
+        second = MODULE["ET"].fromstring(second_source)
+        snapshots = iter(((first, "<hierarchy/>"), (second, second_source)))
+        calls = []
+
+        def fake_rish(command, **_kwargs):
+            calls.append(command)
+            return Result()
+
+        with mock.patch.dict(MODULE["explore"].__globals__, {
+            "snapshot": lambda _package: next(snapshots),
+            "run_rish": fake_rish,
+            "current_package": lambda: "com.example",
+            "display_size": lambda: (1080, 1920),
+        }), mock.patch.object(MODULE["time"], "sleep"):
+            result = MODULE["explore"]("com.example", "save changes", 3, "up")
+        self.assertTrue(result["taskVerified"])
+        self.assertEqual(result["scrollsPerformed"], 1)
+        self.assertEqual(result["candidate"]["text"], "Done")
+        self.assertTrue(any(command.startswith("input swipe") for command in calls))
+
+    def test_explore_stops_when_a_swipe_does_not_change_the_hierarchy(self):
+        source = '<hierarchy><node text="No match" enabled="true" bounds="[0,0][20,20]"/></hierarchy>'
+        root = MODULE["ET"].fromstring(source)
+        with mock.patch.dict(MODULE["explore"].__globals__, {
+            "snapshot": lambda _package: (root, source),
+            "run_rish": lambda *_args, **_kwargs: Result(),
+            "current_package": lambda: "com.example",
+            "display_size": lambda: (1080, 1920),
+        }), mock.patch.object(MODULE["time"], "sleep"):
+            with self.assertRaisesRegex(Exception, "ui_explore_no_movement"):
+                MODULE["explore"]("com.example", "save changes", 3, "up")
 
     def test_click_uses_selector_and_verifies_after_without_real_device(self):
         calls = []

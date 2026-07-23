@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import io
 import os
 import pathlib
 import re
@@ -32,6 +34,8 @@ PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 PACKAGE_IN_TEXT_RE = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z0-9_]+\.)+[A-Za-z0-9_]+(?![A-Za-z0-9_])")
 SHA256_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
 PERMISSION_RE = re.compile(r"\b(?:[A-Za-z0-9_]+\.)+permission\.[A-Za-z0-9_.]+\b")
+STAGED_READ_ROOT = pathlib.Path("/storage/emulated/0/Download/.nemotron-tools/readbacks")
+DEFAULT_STAGED_READ_MAX_BYTES = 16 * 1024 * 1024
 
 READ_ONLY_PM_ACTIONS = frozenset(
     {
@@ -140,6 +144,14 @@ class RemoteResult:
         if self.stdout and self.stderr:
             return self.stdout.rstrip("\n") + "\n" + self.stderr.lstrip("\n")
         return self.stdout or self.stderr
+
+
+@dataclass(frozen=True)
+class StagedReadback:
+    text: str
+    sha256: str
+    bytes: int
+    remote_status: int
 
 
 def sanitized_policy_message(error: AndroidPolicyError) -> str:
@@ -261,6 +273,153 @@ def run_rish(
     if require_success and result.remote_status != 0:
         raise AndroidBridgeError("remote_command_failed", remote_status=result.remote_status)
     return result
+
+
+def read_rish_staged(
+    command: str,
+    *,
+    timeout: float = 60,
+    max_bytes: int = DEFAULT_STAGED_READ_MAX_BYTES,
+) -> StagedReadback:
+    """Read large remote text without trusting rish stdout/stderr stream placement."""
+
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or "\x00" in command
+        or isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 1 <= max_bytes <= 128 * 1024 * 1024
+    ):
+        raise AndroidPolicyError("staged_readback_request")
+    STAGED_READ_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    local = STAGED_READ_ROOT / f"readback-{uuid.uuid4().hex}.txt"
+    quoted = shlex.quote(str(local))
+    staged_command = (
+        f"( {command} ) > {quoted} 2>&1; "
+        "__nemotron_readback_status=$?; "
+        "if [ \"$__nemotron_readback_status\" -ne 0 ]; then "
+        f"rm -f {quoted}; exit \"$__nemotron_readback_status\"; fi; "
+        f"__nemotron_readback_bytes=$(wc -c < {quoted}) || exit $?; "
+        f"__nemotron_readback_sha=$(sha256sum {quoted} | cut -d' ' -f1) || exit $?; "
+        "printf 'NEMOTRON_READBACK bytes=%s sha256=%s\\n' "
+        "\"$__nemotron_readback_bytes\" \"$__nemotron_readback_sha\""
+    )
+    receipt = run_rish(staged_command, timeout=timeout, require_success=False)
+    try:
+        if receipt.remote_status != 0:
+            raise AndroidBridgeError(
+                "staged_readback_remote_failed", remote_status=receipt.remote_status,
+            )
+        match = re.search(
+            r"NEMOTRON_READBACK bytes=(\d+) sha256=([0-9a-fA-F]{64})\b",
+            receipt.combined,
+        )
+        if match is None:
+            raise AndroidBridgeError("staged_readback_receipt_invalid")
+        expected_bytes = int(match.group(1))
+        expected_sha = match.group(2).casefold()
+        if not 0 <= expected_bytes <= max_bytes:
+            raise AndroidBridgeError("staged_readback_size_invalid")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(local, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size != expected_bytes
+                or metadata.st_size > max_bytes
+            ):
+                raise AndroidBridgeError("staged_readback_file_invalid")
+            chunks = []
+            remaining = expected_bytes
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise AndroidBridgeError("staged_readback_truncated")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise AndroidBridgeError("staged_readback_size_changed")
+        finally:
+            os.close(descriptor)
+        data = b"".join(chunks)
+        observed_sha = hashlib.sha256(data).hexdigest()
+        if observed_sha != expected_sha:
+            raise AndroidBridgeError("staged_readback_integrity_failed")
+        try:
+            text = data.decode("utf-8", "strict")
+        except UnicodeDecodeError as error:
+            raise AndroidBridgeError("staged_readback_utf8_invalid") from error
+        return StagedReadback(text, observed_sha, expected_bytes, receipt.remote_status)
+    except OSError as error:
+        raise AndroidBridgeError("staged_readback_file_unavailable") from error
+    finally:
+        local.unlink(missing_ok=True)
+
+
+def verify_png_file(path: pathlib.Path, *, max_bytes: int = 64 * 1024 * 1024) -> dict:
+    """Decode and hash one non-symlinked PNG instead of trusting command success."""
+
+    path = pathlib.Path(path)
+    if (
+        not path.is_absolute()
+        or isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 8 <= max_bytes <= 256 * 1024 * 1024
+    ):
+        raise AndroidPolicyError("png_verification_request")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not 8 <= metadata.st_size <= max_bytes
+            ):
+                raise AndroidBridgeError("png_file_invalid")
+            chunks = []
+            remaining = metadata.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise AndroidBridgeError("png_file_truncated")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise AndroidBridgeError("png_file_size_changed")
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise AndroidBridgeError("png_file_unavailable") from error
+    data = b"".join(chunks)
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise AndroidBridgeError("png_signature_invalid")
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(data)) as image:
+            image_format = image.format
+            width, height = image.size
+    except (ImportError, OSError, ValueError) as error:
+        raise AndroidBridgeError("png_decode_invalid") from error
+    if image_format != "PNG" or not 1 <= width <= 32768 or not 1 <= height <= 32768:
+        raise AndroidBridgeError("png_dimensions_invalid")
+    return {
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "format": "PNG",
+        "width": width,
+        "height": height,
+        "verified": True,
+    }
 
 
 def parse_package_lines(text: str) -> list[str]:

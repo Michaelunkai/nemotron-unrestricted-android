@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 from nemotron_android_policy import (
     AndroidBridgeError,
@@ -23,6 +25,7 @@ from nemotron_android_policy import (
     sanitized_policy_message,
     validate_android_shell_command,
     validate_package_id,
+    verify_png_file,
 )
 
 
@@ -120,6 +123,50 @@ def integer(value, name, *, minimum=None, maximum=None):
     if maximum is not None and parsed > maximum:
         raise AndroidPolicyError(name + "_range")
     return parsed
+
+
+def safe_download_output(value, suffix):
+    if not isinstance(value, str) or "\x00" in value:
+        raise AndroidPolicyError("download_output_path")
+    normalized = (
+        "/storage/emulated/0/" + value[len("/sdcard/"):]
+        if value.startswith("/sdcard/") else value
+    )
+    pure = pathlib.PurePosixPath(normalized)
+    root = pathlib.PurePosixPath("/storage/emulated/0/Download")
+    if (
+        not pure.is_absolute()
+        or pure.suffix.casefold() != suffix
+        or pure == root
+        or pure.parts[:len(root.parts)] != root.parts
+        or any(part in {"", ".", ".."} for part in pure.parts[1:])
+    ):
+        raise AndroidPolicyError("download_output_path")
+    return pathlib.Path(str(pure))
+
+
+def verify_xml_dump(path):
+    if not path.is_file() or path.is_symlink() or not 1 <= path.stat().st_size <= 8 * 1024 * 1024:
+        raise AndroidBridgeError("ui_dump_file_invalid")
+    try:
+        data = path.read_bytes()
+        source = data.decode("utf-8", "strict")
+        root = ET.fromstring(source)
+    except (OSError, UnicodeDecodeError, ET.ParseError) as error:
+        raise AndroidBridgeError("ui_dump_decode_invalid") from error
+    if root.tag != "hierarchy":
+        raise AndroidBridgeError("ui_dump_root_invalid")
+    component = resumed_component()
+    return {
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "root": root.tag,
+        "nodeCount": sum(1 for _ in root.iter("node")),
+        "component": component,
+        "package": component.split("/", 1)[0] if component else None,
+        "verified": bool(component),
+    }
 
 
 def handle_open(target):
@@ -400,19 +447,34 @@ def main():
             return 0 if ok else 5
         if action == "screenshot":
             require_arity(args, 0, 1)
-            path = args[0] if args else "/sdcard/Download/nemotron-screenshot.png"
-            if not path.startswith(("/sdcard/Download/", "/storage/emulated/0/Download/")):
-                raise AndroidPolicyError("screenshot_path")
-            result = run_rish("screencap -p " + shlex.quote(path))
-            emit({"path": path, "captured": result.remote_status == 0, "verified": result.remote_status == 0})
+            path = safe_download_output(
+                args[0] if args else "/storage/emulated/0/Download/nemotron-screenshot.png",
+                ".png",
+            )
+            result = run_rish("screencap -p " + shlex.quote(str(path)))
+            receipt = verify_png_file(path)
+            component = resumed_component()
+            receipt.update({
+                "captured": result.remote_status == 0,
+                "component": component,
+                "package": component.split("/", 1)[0] if component else None,
+            })
+            receipt["verified"] = (
+                result.remote_status == 0 and receipt["verified"] and bool(component)
+            )
+            emit(receipt)
             return 0
         if action == "dump":
             require_arity(args, 0, 1)
-            path = args[0] if args else "/sdcard/Download/nemotron-window.xml"
-            if not path.startswith(("/sdcard/Download/", "/storage/emulated/0/Download/")):
-                raise AndroidPolicyError("dump_path")
-            result = run_rish("uiautomator dump " + shlex.quote(path))
-            emit({"path": path, "captured": result.remote_status == 0, "verified": result.remote_status == 0})
+            path = safe_download_output(
+                args[0] if args else "/storage/emulated/0/Download/nemotron-window.xml",
+                ".xml",
+            )
+            result = run_rish("uiautomator dump " + shlex.quote(str(path)))
+            receipt = verify_xml_dump(path)
+            receipt["captured"] = result.remote_status == 0
+            receipt["verified"] = result.remote_status == 0 and receipt["verified"]
+            emit(receipt)
             return 0
         if action == "settings":
             require_arity(args, 1, 1000)

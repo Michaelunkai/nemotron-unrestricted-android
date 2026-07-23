@@ -15,7 +15,7 @@ Use this skill whenever the request involves an Android app, visible UI, gallery
 3. Read the fresh screen with `codex-android dump`; use text/resource descriptions when present and coordinates only from current bounds.
 4. Tap/type/swipe, dump again, and verify the requested visible postcondition. Retry bounded alternatives after stale UI or navigation changes.
 5. Never bypass Android authentication, device locks, account consent, payment confirmation, or another person's access controls. Report such an actual external gate precisely only after autonomous supported routes are exhausted.
-6. For unfamiliar screens, run `codex-ui-safe suggest --package <id> --goal '<action>'`, select a fresh unique semantic candidate, then execute with an exact selector and mandatory after-selector. Refresh after every navigation because nodes become stale.
+6. For unfamiliar screens, run `codex-ui-safe suggest --package <id> --goal '<action>'`. If the target is not on the current screen, use `codex-ui-safe explore --package <id> --goal '<action>' --max-scrolls N`; it stops on no movement, ambiguity, package drift, or the bound. Execute with an exact selector and mandatory after-selector. Refresh after every navigation because nodes become stale.
 
 ## Travel and local planning
 
@@ -44,7 +44,7 @@ Use this skill whenever the request involves an Android app, visible UI, gallery
 - Successful face and semantic scans emit `nemotron.gallery-result.v1`; the Android conversation renders every verified image in that page automatically, with lazy previews and full-size tap-to-open viewing. Do not replace the receipt with a bare command, filenames, or a promise to show images later.
 - When the user asks for all/every matching image, keep calling the same scan with the returned `nextOffset` until `hasMore` is false. Preserve the same query, hours, limit, and face threshold on every page. Do not claim the full gallery is complete from a page whose receipt says `hasMore:true`.
 - Image-generation requests must produce a real structured image-generation result or a verified local image file that the conversation can render. Text claiming that an image was generated, a filename alone, or an inaccessible URL is not completion evidence.
-- Read exact metadata with `codex-gallery metadata --kind image|video --id N`, transcribe visible image text with `ocr`, create checksum-verified non-destructive copies or JPEG/PNG/WebP image transforms with `export`, and dispatch an Android share intent with `share`. Preserve the original unless the user separately and explicitly requests a recoverable mutation.
+- Read exact metadata with `codex-gallery metadata --kind image|video --id N`, transcribe one image locally with `ocr --language eng --psm 3|6|11`, or find visible text across the gallery with `ocr-search '<text>' --hours N --limit N --offset N`. OCR search is offline, generation-cached, paginated, and emits the same verified inline image receipt. Create checksum-verified non-destructive copies or JPEG/PNG/WebP image transforms with `export`, and dispatch an Android share intent with `share`. Preserve the original unless the user separately and explicitly requests a recoverable mutation.
 - Use installed image/video/OCR tools only after checking the command and preserve originals unless the user explicitly requests mutation.
 
 ## Search, download, and install

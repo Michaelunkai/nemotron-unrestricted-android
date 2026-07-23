@@ -14,7 +14,13 @@ import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 
-from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_rish, validate_package_id
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    run_rish,
+    validate_package_id,
+    verify_png_file,
+)
 
 
 BOUNDS = re.compile(r"^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$")
@@ -279,7 +285,7 @@ def validate_spec(value):
         if not isinstance(step, dict) or set(step) - allowed:
             raise UiError("step_schema_invalid")
         action = step.get("action")
-        if action not in {"click", "set-text", "swipe", "back"}:
+        if action not in {"click", "long-click", "set-text", "swipe", "back", "wait"}:
             raise UiError("step_action_invalid")
         retries = step.get("retries", 2)
         if isinstance(retries, bool) or not isinstance(retries, int) or not 1 <= retries <= 5:
@@ -292,8 +298,10 @@ def validate_spec(value):
             or any(isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 100000 for item in fallback)
         ):
             raise UiError("fallback_coordinates_invalid")
-        if action in {"click", "set-text"} and before is None and fallback is None:
+        if action in {"click", "long-click", "set-text"} and before is None and fallback is None:
             raise UiError("action_target_missing")
+        if action == "wait" and before is not None:
+            raise UiError("wait_selector_is_after")
         if action == "set-text":
             text = step.get("text")
             if not isinstance(text, str) or len(text) > 4096 or any(ord(char) < 32 for char in text):
@@ -304,7 +312,86 @@ def validate_spec(value):
     return result
 
 
+def display_size():
+    display = run_rish("wm size").combined
+    match = re.search(r"Override size: (\d+)x(\d+)", display)
+    if match is None:
+        match = re.search(r"Physical size: (\d+)x(\d+)", display)
+    if match is None:
+        raise UiError("display_size_unavailable")
+    width, height = map(int, match.groups())
+    if not 1 <= width <= 100000 or not 1 <= height <= 100000:
+        raise UiError("display_size_invalid")
+    return width, height
+
+
+def directional_swipe(direction, duration=300):
+    width, height = display_size()
+    points = {
+        "up": (width // 2, height * 3 // 4, width // 2, height // 4),
+        "down": (width // 2, height // 4, width // 2, height * 3 // 4),
+        "left": (width * 3 // 4, height // 2, width // 4, height // 2),
+        "right": (width // 4, height // 2, width * 3 // 4, height // 2),
+    }[direction]
+    return "input swipe %d %d %d %d %d" % (*points, duration)
+
+
+def explore(package, goal, max_scrolls, direction):
+    if not 0 <= max_scrolls <= 20 or direction not in {"up", "down"}:
+        raise UiError("explore_bounds_invalid")
+    seen = set()
+    snapshots = []
+    best_candidates = []
+    for scrolls in range(max_scrolls + 1):
+        root, source = snapshot(package)
+        digest = hashlib.sha256(source.encode()).hexdigest()
+        if digest in seen:
+            raise UiError("ui_explore_no_movement")
+        seen.add(digest)
+        candidates = semantic_suggestions(root, goal, 8)
+        best_candidates = candidates
+        snapshots.append({
+            "index": scrolls + 1,
+            "sha256": digest,
+            "candidateCount": len(candidates),
+            "message": (
+                f"Inspected package-scoped screen {scrolls + 1}; found "
+                f"{len(candidates)} possible target(s)."
+            ),
+        })
+        if candidates and candidates[0]["score"] >= 60:
+            if len(candidates) == 1 or candidates[0]["score"] - candidates[1]["score"] >= 10:
+                return {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": True,
+                    "package": package,
+                    "goal": goal,
+                    "candidate": candidates[0],
+                    "scrollsPerformed": scrolls,
+                    "snapshots": snapshots,
+                    "message": (
+                        f"Found one unambiguous package-scoped target after {scrolls} "
+                        "scroll action(s); no target was clicked."
+                    ),
+                }
+        if scrolls == max_scrolls:
+            break
+        action = run_rish(directional_swipe(direction), require_success=False)
+        if action.remote_status != 0:
+            raise UiError("ui_explore_swipe_failed")
+        if current_package() != package:
+            raise UiError("foreground_package_changed")
+        time.sleep(0.2)
+    if len(best_candidates) > 1 and best_candidates[0]["score"] >= 60:
+        raise UiError("semantic_selector_ambiguous")
+    raise UiError("semantic_selector_not_found")
+
+
 def act(package, step):
+    if step["action"] == "wait":
+        _, _, attempts = wait_for(package, step["after"], step["retries"])
+        return attempts, None
     root = None
     target = None
     if step["selector"]:
@@ -315,35 +402,32 @@ def act(package, step):
                 raise
     action = step["action"]
     coordinates = None
-    if action in {"click", "set-text"}:
+    if action in {"click", "long-click", "set-text"}:
         coordinates = center(target) if target is not None else tuple(step["fallbackCoordinates"])
     if action == "click":
         command = f"input tap {coordinates[0]} {coordinates[1]}"
+    elif action == "long-click":
+        duration = step.get("durationMs", 800)
+        if not isinstance(duration, int) or not 100 <= duration <= 5000:
+            raise UiError("long_click_duration_invalid")
+        command = (
+            f"input swipe {coordinates[0]} {coordinates[1]} "
+            f"{coordinates[0]} {coordinates[1]} {duration}"
+        )
     elif action == "set-text":
         command = f"input tap {coordinates[0]} {coordinates[1]} && input keyevent KEYCODE_MOVE_END && input text {shlex.quote(step['text'])}"
     elif action == "back":
         command = "input keyevent KEYCODE_BACK"
     else:
-        display = run_rish("wm size").combined
-        match = re.search(r"Physical size: (\d+)x(\d+)", display) or re.search(r"Override size: (\d+)x(\d+)", display)
-        if not match:
-            raise UiError("display_size_unavailable")
-        width, height = map(int, match.groups())
-        points = {
-            "up": (width // 2, height * 3 // 4, width // 2, height // 4),
-            "down": (width // 2, height // 4, width // 2, height * 3 // 4),
-            "left": (width * 3 // 4, height // 2, width // 4, height // 2),
-            "right": (width // 4, height // 2, width * 3 // 4, height // 2),
-        }[step["direction"]]
         duration = step.get("durationMs", 300)
         if not isinstance(duration, int) or not 1 <= duration <= 5000:
             raise UiError("swipe_duration_invalid")
-        command = "input swipe %d %d %d %d %d" % (*points, duration)
+        command = directional_swipe(step["direction"], duration)
     result = run_rish(command, require_success=False)
     if result.remote_status != 0:
         raise UiError("ui_action_failed")
     _, _, attempts = wait_for(package, step["after"], step["retries"])
-    return attempts, coordinates if action in {"click", "set-text"} else None
+    return attempts, coordinates if action in {"click", "long-click", "set-text"} else None
 
 
 def main():
@@ -356,6 +440,11 @@ def main():
     suggest.add_argument("--package", required=True)
     suggest.add_argument("--goal", required=True)
     suggest.add_argument("--limit", type=int, default=8)
+    explore_command = commands.add_parser("explore")
+    explore_command.add_argument("--package", required=True)
+    explore_command.add_argument("--goal", required=True)
+    explore_command.add_argument("--max-scrolls", type=int, default=8)
+    explore_command.add_argument("--direction", choices=("up", "down"), default="up")
     run = commands.add_parser("run")
     run.add_argument("--package", required=True)
     run.add_argument("--spec", required=True)
@@ -363,7 +452,9 @@ def main():
     args = parser.parse_args()
     try:
         package = validate_package_id(args.package)
-        if args.command in {"snapshot", "suggest"}:
+        if args.command == "explore":
+            output = explore(package, args.goal, args.max_scrolls, args.direction)
+        elif args.command in {"snapshot", "suggest"}:
             root, source = snapshot(package)
             if args.command == "snapshot":
                 wanted = selector(json.loads(args.selector)) if args.selector else None
@@ -402,17 +493,21 @@ def main():
                 })
             screenshot = None
             if args.screenshot:
-                path = pathlib.Path(args.screenshot).expanduser().resolve()
+                path = pathlib.Path(args.screenshot)
+                if not path.is_absolute():
+                    raise UiError("screenshot_path_invalid")
+                path = path.resolve()
                 download = pathlib.Path("/storage/emulated/0/Download").resolve()
-                if path.parent != download or path.suffix.lower() != ".png":
+                if (
+                    download not in path.parents
+                    or path.suffix.lower() != ".png"
+                    or path.is_symlink()
+                ):
                     raise UiError("screenshot_path_invalid")
                 result = run_rish("screencap -p " + shlex.quote(str(path)), require_success=False)
-                if result.remote_status != 0 or not path.is_file():
+                if result.remote_status != 0:
                     raise UiError("screenshot_failed")
-                screenshot = {
-                    "path": str(path), "bytes": path.stat().st_size,
-                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                }
+                screenshot = verify_png_file(path)
             output = {
                 "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
                 "package": package, "events": events, "screenshot": screenshot,

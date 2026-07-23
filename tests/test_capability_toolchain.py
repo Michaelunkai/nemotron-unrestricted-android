@@ -491,7 +491,7 @@ class CapabilityToolchainTests(unittest.TestCase):
         packages = (ROOT / "toolchain/termux-packages.txt").read_text(encoding="utf-8")
         for package in (
             "openssl-tool", "dnsutils", "ripgrep", "yara", "radare2", "apktool",
-            "golang", "rust", "cmake", "zip", "p7zip",
+            "golang", "rust", "cmake", "zip", "p7zip", "tesseract",
         ):
             self.assertIn(package, packages)
 
