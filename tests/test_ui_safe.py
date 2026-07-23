@@ -74,6 +74,16 @@ class UiSafeTests(unittest.TestCase):
         self.assertEqual(len(suggestions), 1)
         self.assertEqual(suggestions[0]["text"], "Sign in")
 
+    def test_read_only_ui_inspection_retries_missing_remote_status(self):
+        missing = MODULE["AndroidBridgeError"]("remote_status_missing")
+        completed = Result("<hierarchy/>")
+        run = mock.Mock(side_effect=[missing, completed])
+        with mock.patch.dict(MODULE["read_rish"].__globals__, {"run_rish": run}), \
+             mock.patch.object(MODULE["time"], "sleep"):
+            result = MODULE["read_rish"]("uiautomator dump")
+        self.assertIs(result, completed)
+        self.assertEqual(run.call_count, 2)
+
     def test_workflow_requires_postconditions_and_rejects_bad_fallback(self):
         with self.assertRaisesRegex(Exception, "selector_invalid"):
             MODULE["validate_spec"]([{"action": "click", "selector": {"text": "x"}}])
