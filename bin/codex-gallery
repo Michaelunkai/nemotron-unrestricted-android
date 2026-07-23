@@ -301,6 +301,33 @@ def detect_face_batches(paths, remote_jar, batch_size=8):
     return by_path
 
 
+def stage_face_detector(trusted_jar, digest, attempts=3):
+    """Copy the detector through shared storage and verify the exact remote byte hash."""
+    shared_stage = pathlib.Path("/storage/emulated/0/Download/.nemotron-tools/nemotron-face-detector.jar")
+    shared_stage.parent.mkdir(parents=True, exist_ok=True)
+    remote_jar = f"/data/local/tmp/nemotron-face-detector-{digest}.jar"
+    for attempt in range(1, attempts + 1):
+        shutil.copyfile(trusted_jar, shared_stage)
+        shared_stage.chmod(0o644)
+        staged = run_rish(
+            f"cp {shlex.quote(str(shared_stage))} {shlex.quote(remote_jar)}",
+            require_success=False,
+        )
+        remote_hash = run_rish(f"sha256sum {shlex.quote(remote_jar)}", require_success=False)
+        observed = re.search(r"(?m)^([0-9a-fA-F]{64})(?:\s|$)", remote_hash.stdout)
+        if (
+            staged.remote_status == 0
+            and observed is not None
+            and observed.group(1).casefold() == digest.casefold()
+        ):
+            return remote_jar
+        if attempt < attempts:
+            progress(f"detector staging verification attempt {attempt} failed; retrying the exact copy and hash.")
+    if staged.remote_status != 0:
+        raise AndroidBridgeError("face_detector_stage_failed")
+    raise AndroidBridgeError("face_detector_integrity_failed")
+
+
 def face_inventory(args):
     offset = getattr(args, "offset", 0)
     no_present = getattr(args, "no_present", True)
@@ -335,19 +362,7 @@ def face_inventory(args):
         raise AndroidBridgeError("face_detector_missing")
     trusted_jar = pathlib.Path(jar_lines[-1])
     digest = hashlib.sha256(trusted_jar.read_bytes()).hexdigest()
-    shared_stage = pathlib.Path("/storage/emulated/0/Download/.nemotron-tools/nemotron-face-detector.jar")
-    shared_stage.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(trusted_jar, shared_stage)
-    shared_stage.chmod(0o644)
-    remote_jar = f"/data/local/tmp/nemotron-face-detector-{digest}.jar"
-    staged = run_rish(
-        f"cp {shlex.quote(str(shared_stage))} {shlex.quote(remote_jar)}", require_success=False,
-    )
-    if staged.remote_status != 0:
-        raise AndroidBridgeError("face_detector_stage_failed")
-    remote_hash = run_rish(f"sha256sum {shlex.quote(remote_jar)}", require_success=False)
-    if remote_hash.remote_status != 0 or digest not in remote_hash.stdout.casefold():
-        raise AndroidBridgeError("face_detector_integrity_failed")
+    remote_jar = stage_face_detector(trusted_jar, digest)
     paths = [safe_media_path(record) for record in candidates]
     by_path = detect_face_batches(paths, remote_jar)
     items = []

@@ -83,13 +83,14 @@ class GalleryTests(unittest.TestCase):
             stderr="",
         )
         staged = types.SimpleNamespace(remote_status=0, stdout="", stderr="")
-        remote_hash = types.SimpleNamespace(remote_status=0, stdout="PLACEHOLDER", stderr="")
+        digest = "f" * 64
+        remote_hash = types.SimpleNamespace(remote_status=0, stdout=digest + "  detector.jar\n", stderr="")
         args = types.SimpleNamespace(hours=24, limit=10, min_faces=1)
         with mock.patch.object(GALLERY, "query_kind", return_value=[record]), \
              mock.patch.object(GALLERY.time, "time", return_value=now), \
              mock.patch.object(GALLERY.subprocess, "run", return_value=build), \
              mock.patch.object(GALLERY.pathlib.Path, "read_bytes", return_value=b"detector"), \
-             mock.patch.object(GALLERY.hashlib, "sha256", return_value=types.SimpleNamespace(hexdigest=lambda: "placeholder")), \
+             mock.patch.object(GALLERY.hashlib, "sha256", return_value=types.SimpleNamespace(hexdigest=lambda: digest)), \
              mock.patch.object(GALLERY.shutil, "copyfile"), \
              mock.patch.object(GALLERY.pathlib.Path, "chmod"), \
              mock.patch.object(GALLERY, "run_rish", side_effect=[staged, remote_hash, detection]):
@@ -133,6 +134,25 @@ class GalleryTests(unittest.TestCase):
             result = GALLERY.detect_face_batches(paths, "/data/local/tmp/detector.jar")
         self.assertEqual(len(run.call_args_list), 2)
         self.assertEqual(result[paths[1]]["faceCount"], 1)
+
+    def test_detector_staging_retries_until_exact_remote_hash(self):
+        temporary = pathlib.Path(tempfile.mkdtemp(prefix="gallery-detector-", dir=ROOT / "workspace"))
+        try:
+            detector = temporary / "detector.jar"
+            detector.write_bytes(b"verified detector")
+            digest = GALLERY.hashlib.sha256(detector.read_bytes()).hexdigest()
+            failed_copy = types.SimpleNamespace(remote_status=1, stdout="")
+            wrong_hash = types.SimpleNamespace(remote_status=0, stdout="0" * 64 + "  remote.jar\n")
+            copied = types.SimpleNamespace(remote_status=0, stdout="")
+            exact_hash = types.SimpleNamespace(remote_status=0, stdout=digest + "  remote.jar\n")
+            with mock.patch.object(
+                GALLERY, "run_rish", side_effect=[failed_copy, wrong_hash, copied, exact_hash],
+            ) as run:
+                remote = GALLERY.stage_face_detector(detector, digest)
+            self.assertEqual(len(run.call_args_list), 4)
+            self.assertTrue(remote.endswith(digest + ".jar"))
+        finally:
+            shutil.rmtree(temporary)
 
     def test_face_verification_counts_unique_paths_not_duplicate_media_rows(self):
         paths = ["/storage/emulated/0/DCIM/Camera/same.jpg"] * 2
