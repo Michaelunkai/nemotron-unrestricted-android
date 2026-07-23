@@ -35,6 +35,10 @@ SEMANTIC_EQUIVALENTS = (
     {"edit", "change", "modify"},
     {"login", "signin", "sign", "account"},
 )
+SEMANTIC_GENERIC_TERMS = {
+    "a", "an", "and", "app", "button", "change", "changes", "current", "for",
+    "in", "item", "menu", "of", "or", "screen", "task", "the", "this", "to",
+}
 UI_STAGE_ROOT = pathlib.Path("/storage/emulated/0/Download/.nemotron-tools/ui-snapshots")
 MAX_UI_SNAPSHOT_BYTES = 4 * 1024 * 1024
 
@@ -142,6 +146,10 @@ def semantic_score(node, query):
     )
     haystack = normalized(" ".join(fields))
     haystack_terms = set(haystack.split())
+    action_terms = set().union(*SEMANTIC_EQUIVALENTS)
+    object_terms = original - action_terms - SEMANTIC_GENERIC_TERMS
+    if object_terms and not object_terms.intersection(haystack_terms):
+        return 0
     matches = sum(
         1 for term in original
         if term in haystack_terms

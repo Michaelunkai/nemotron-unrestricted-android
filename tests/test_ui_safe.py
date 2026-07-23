@@ -77,7 +77,7 @@ class UiSafeTests(unittest.TestCase):
     def test_generic_view_class_does_not_outrank_visible_target_text(self):
         root = MODULE["ET"].fromstring(
             '<hierarchy>'
-            '<node text="" class="android.view.View" enabled="true" bounds="[0,0][10,10]" />'
+            '<node text="" resource-id="app:id/recycler_view" class="android.view.View" enabled="true" bounds="[0,0][10,10]" />'
             '<node text="Connections" class="android.widget.TextView" enabled="true" bounds="[20,0][80,20]" />'
             '</hierarchy>'
         )
