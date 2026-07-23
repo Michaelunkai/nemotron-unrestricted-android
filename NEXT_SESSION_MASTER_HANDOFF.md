@@ -1,7 +1,155 @@
 # Nemotron Unrestricted — authoritative next-session handoff
 
 Updated: 2026-07-23 UTC
-Status: v1.6.0/code 7 implementation, deterministic signed build, preserved-state in-place installation, private Android verification, gallery/network/PC/model/tone verification, and release documentation are complete. The publication/readback section below records the final GitHub state.
+Status: v1.7.0/code 8 implementation, deterministic signed build, protected-state upgrade rehearsal, private Android verification, and real inline gallery-image delivery are complete. The final publication, public-download readback, and final in-place reinstall are the only remaining release operations at this checkpoint.
+
+## Authoritative v1.7.0 checkpoint
+
+This section supersedes every older version, hash, test count, branch, APK, and
+remaining-work statement below wherever they conflict. Retain the older sections:
+they contain architecture, recovery commands, and failure history that still
+apply.
+
+### Exact project and release identity
+
+- Authoritative production root:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app`
+- Clean v1.7 implementation worktree:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app-v1.7`
+- Clean release branch: `agent/inline-gallery-images-v1.7`
+- Public repository:
+  `https://github.com/Michaelunkai/nemotron-unrestricted-android`
+- Public v1.6 base: `9951a0a5`
+- Protected pre-v1.6 user-worktree archive:
+  `refs/archive/pre-v16-user-worktree-20260723`
+- Protected archive commit:
+  `4dcf1b6e5df12671c4681ef9a90ef3e4a69614b7`
+- v1.7 release content commit: `4c3546b`
+- v1.7 release content tree:
+  `9df97b6c87e4f8757bc7d3ebee9a5d19c3ba5f77`
+- Android package: `com.michaelovsky.nemotronunrestricted.isolated`
+- Main activity: `.MainActivity`
+- Sticky foreground service: `.NemotronRuntimeService`
+- Release: `v1.7.0`
+- Android versionName/versionCode: `1.7.0` / `8`
+- Signed APK:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app-v1.7/dist/Nemotron-Unrestricted-1.7.0.apk`
+- APK size: `296498` bytes
+- APK SHA-256:
+  `aee351cc5cfd2735dd5bb16cbdd0ce51244e88d54bb5149b91420e5838634a90`
+- Signing certificate SHA-256:
+  `f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f`
+- Verified APK signature schemes: v1, v2, and v3
+- Release metadata:
+  `dist/Nemotron-Unrestricted-1.7.0.apk.sha256`,
+  `dist/Nemotron-Unrestricted-1.7.0.apk.idsig`,
+  `dist/Nemotron-Unrestricted-1.7.0.apk.release.json`,
+  `release-notes/1.7.0.md`, and
+  `release-notes/1.7.0-release-manifest.json`
+
+### What v1.7.0 adds
+
+- `codex-gallery faces` and `codex-gallery semantic` now emit the strict
+  `nemotron.gallery-result.v1` envelope. Successful receipts contain verified
+  MediaStore-bound `render.images[]` records with path, MediaStore ID, MIME
+  type, byte size, label, and verification state.
+- The Android conversation UI recognizes only completed exit-code-zero gallery
+  commands with the exact schema and `verified-local-image-grid` render type.
+  It automatically expands them and displays real lazy-loaded image tiles
+  through the existing same-origin `/codex-local-image` endpoint.
+- Tapping an inline tile opens the existing full-size image viewer. The
+  established native generated-image path remains unchanged and continues to
+  render structured model-generated image artifacts in the same session.
+- The parser rejects private paths, unsupported MIME types, unsafe MediaStore
+  IDs, oversized result sets, failed commands, malformed JSON, and unrelated
+  command output. These stay visible as technical text rather than being
+  treated as trusted images.
+- Every selectable model receives the same gallery contract. A request for
+  “all” or “every” match must continue with the returned `nextOffset` and the
+  same scan parameters until `hasMore` is false. Bare commands, prose
+  filenames, or unrendered paths are not valid image completion.
+- The existing safety boundary remains deliberate: face presence and
+  non-sensitive visible features are supported; identity, gender, ethnicity,
+  or other sensitive attributes are not inferred from appearance.
+
+### Validation and live evidence
+
+- Source validation passed: 107 Python tests, 37 shell tests, three JavaScript
+  harnesses, frontend patch reproducibility, four 945×2048 UI goldens, progress
+  rendering checks, and gallery rendering checks.
+- The path-independent suite passed 354 tests. Two isolated-worktree tests were
+  excluded only because they intentionally assert the production root’s exact
+  absolute path:
+  `test_powershell_and_codex_win_safe_routes_are_mocked` and
+  `test_project_local_runtime_capability_delegates`.
+- A focused 51-test gallery/frontend/runtime suite passed.
+- Two consecutive signed release builds were byte-identical with the APK hash
+  recorded above.
+- Current-tree and signed-APK secret scans passed. Do not scan private
+  archive/legacy Git objects as though they were public release content; verify
+  public lineage separately and use `--current-only --apk` for release inputs.
+- Private WebView proof passed on an `OWN_CONTENT_ONLY` virtual display:
+  `ready=true`, one lazy bundle execution, gallery route available, settings
+  and cleanup UI present, zero errors, and `physicalDisplay=false`.
+- Live gallery page one returned a valid zero-result envelope with
+  `hasMore=true` and `nextOffset=3`.
+- Live gallery page two processed the next 20 candidates, recovered detector
+  omissions with individual retries, found two face-presence matches, and
+  produced one verified contact sheet with `nextOffset=23`.
+- Both returned original images were fetched through `/codex-local-image`,
+  their MIME types matched, Pillow decoded them, and the fetched contact-sheet
+  hash matched the receipt. Final proof:
+  `LIVE_GALLERY_IMAGE_DELIVERY_OK guiPort=5903 count=2 fetched=2 sheets=1 nextOffset=23`.
+- Private live receipts:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/gallery-v17-live-proof.json`
+  and
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/gallery-v17-live-proof-page2.json`.
+
+### Preservation and installation rules
+
+- Never uninstall the package and never clear package data during an upgrade.
+- Production preservation manifest:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/preservation/v17-before.sha256`
+- Narrow production-runtime sync backup:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/v17-production-sync-backup`
+- Baseline and rehearsal readback matched: five session files, five JSONL
+  files, five unique thread IDs, fingerprint
+  `8f8c4f95071f933044a6ac3d`, five project roots, fingerprint
+  `891ccfa1ced7653d2bd73919`, readable SQLite databases, and zero parse errors.
+- The successful rehearsal installed v1.7.0/code 8 in place, retained signer and
+  permissions, and retained `firstInstallTime` `2026-07-20 00:36:04`.
+- Before any final install, require zero active turns, verify the exact APK
+  hash and signer, then use Package Manager’s streamed
+  `install-create -r -t`, `install-write`, and `install-commit` flow. Read back
+  installed base APK hash/version/signer and preservation evidence afterward.
+
+### Dynamic runtime and continuation rules
+
+Always source the live port file immediately before a request:
+
+`/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/supervisor/ports.env`
+
+The runtime may briefly select alternate free ports while restarting and then
+converge to the preferred set. At this checkpoint it reports GUI `5903`, proxy
+`18774`, and supervisor `18775`. Never hard-code these values. Verify `/health`
+and require `activeTurnCount=0` before release installation.
+
+The remaining release sequence is narrow:
+
+1. Commit this v1.7 handoff update on the clean public lineage.
+2. Create annotated tag `v1.7.0`.
+3. Push the clean branch to public `main` and push only the v1.7 tag.
+4. Create the GitHub v1.7.0 release with signed APK, checksum, signature
+   metadata, release manifest, and deterministic source archive.
+5. Download the public APK into a temporary directory and independently verify
+   its hash, size, package, version, and signer.
+6. Perform the final in-place streamed reinstall without uninstall or data
+   clearing.
+7. Repeat package, preservation, foreground service, private WebView, and real
+   inline gallery-image delivery verification.
+8. Record publication URLs and final evidence in this file, copy the completed
+   handoff to the production root, commit/push the final documentation update,
+   and stop after outputting the full production handoff path.
 
 ## Immediate continuation contract
 
