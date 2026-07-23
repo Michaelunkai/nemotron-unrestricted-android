@@ -1,0 +1,174 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Serialized paired-PC health monitor with thresholded optional alerts."""
+
+import argparse
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+from nemotron_automation import DEFAULT_STATE, AutomationState, atomic_write
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE = DEFAULT_STATE / "pc-monitor.json"
+PID_FILE = DEFAULT_STATE / "pc-monitor.pid"
+PC = os.environ.get("NEMOTRON_PC_COMMAND", str(ROOT / "bin" / "codex-pc"))
+NOTIFY = os.environ.get("NEMOTRON_NOTIFICATION_COMMAND", "/data/data/com.termux/files/usr/bin/termux-notification")
+THRESHOLD = 3
+
+
+def load():
+    if not STATE.exists():
+        return {"schemaVersion": 1, "consecutiveFailures": 0, "lastOutcome": None, "lastAlertEpoch": None}
+    value = json.loads(STATE.read_text(encoding="utf-8"))
+    if value.get("schemaVersion") != 1:
+        raise RuntimeError("monitor_state_invalid")
+    return value
+
+
+def save(value):
+    atomic_write(STATE, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
+
+
+def process_is_monitor(pid):
+    try:
+        command = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return False
+    return "codex-pc-monitor" in command and "loop" in command
+
+
+def notify(state):
+    result = subprocess.run([
+        NOTIFY, "--id", "nemotron-pc-monitor",
+        "--title", "Nemotron PC connection needs attention",
+        "--content", f"The paired PC failed {state['consecutiveFailures']} verified health checks.",
+        "--priority", "high",
+    ], cwd=ROOT, capture_output=True, text=True, timeout=15, check=False)
+    return result.returncode == 0
+
+
+def run_once(alerts):
+    state = load()
+    started = time.monotonic()
+    result = subprocess.run(
+        [PC, "diagnostics", "--fresh", "--timeout", "5"],
+        cwd=ROOT, capture_output=True, text=True, timeout=25, check=False,
+    )
+    now = int(time.time())
+    verified = False
+    if result.returncode == 0:
+        try:
+            receipt = json.loads(result.stdout)
+            verified = receipt.get("verified") is True and receipt.get("taskVerified") is True
+        except json.JSONDecodeError:
+            verified = False
+    automation = AutomationState()
+    if verified:
+        state["consecutiveFailures"] = 0
+        state["lastOutcome"] = "verified"
+        state["lastVerifiedEpoch"] = now
+        state["lastErrorCategory"] = None
+        automation.increment("pc_monitor_success")
+    else:
+        state["consecutiveFailures"] += 1
+        state["lastOutcome"] = "failed"
+        state["lastFailureEpoch"] = now
+        try:
+            failure = json.loads(result.stderr)
+            state["lastErrorCategory"] = failure.get("failureCategory", "transport")
+        except json.JSONDecodeError:
+            state["lastErrorCategory"] = "transport"
+        automation.increment("pc_monitor_failure")
+        last_alert = state.get("lastAlertEpoch") or 0
+        if alerts and state["consecutiveFailures"] >= THRESHOLD and now - last_alert >= 900:
+            state["lastAlertDelivered"] = notify(state)
+            state["lastAlertEpoch"] = now
+    state["lastCheckEpoch"] = now
+    state["lastLatencyMs"] = round((time.monotonic() - started) * 1000, 1)
+    save(state)
+    print(json.dumps({
+        "schemaVersion": 1, "action": "Verify the paired PC health",
+        "processCompleted": True, "taskVerified": verified,
+        "state": state,
+        "message": "The paired PC health receipt was verified." if verified else "The paired PC health check failed; no online state was claimed.",
+    }, sort_keys=True))
+    return 0 if verified else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-pc-monitor",
+        description="Run, start, inspect, or stop bounded paired-PC health monitoring.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    once = commands.add_parser("run-once")
+    once.add_argument("--notify", action="store_true")
+    start = commands.add_parser("start")
+    start.add_argument("--interval", type=int, default=60)
+    start.add_argument("--notify", action="store_true")
+    start.add_argument("--boot", action="store_true")
+    loop = commands.add_parser("loop")
+    loop.add_argument("--interval", type=int, required=True)
+    loop.add_argument("--notify", action="store_true")
+    commands.add_parser("status")
+    commands.add_parser("stop")
+    args = parser.parse_args()
+    try:
+        if args.command == "run-once":
+            return run_once(args.notify)
+        if args.command == "loop":
+            if not 30 <= args.interval <= 3600:
+                raise RuntimeError("interval_invalid")
+            while True:
+                run_once(args.notify)
+                time.sleep(args.interval)
+        if args.command == "status":
+            pid = int(PID_FILE.read_text()) if PID_FILE.is_file() else None
+            running = bool(pid and process_is_monitor(pid))
+            print(json.dumps({"schemaVersion": 1, "action": "Inspect PC health monitor", "processCompleted": True, "taskVerified": True, "running": running, "pid": pid if running else None, "state": load()}, sort_keys=True))
+            return 0
+        if args.command == "start":
+            if not 30 <= args.interval <= 3600:
+                raise RuntimeError("interval_invalid")
+            if PID_FILE.is_file():
+                pid = int(PID_FILE.read_text())
+                if process_is_monitor(pid):
+                    print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": True, "message": "The PC health monitor is already running.", "pid": pid}, sort_keys=True))
+                    return 0
+            arguments = [sys.executable, str(pathlib.Path(__file__).resolve()), "loop", "--interval", str(args.interval)]
+            if args.notify:
+                arguments.append("--notify")
+            process = subprocess.Popen(arguments, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            atomic_write(PID_FILE, f"{process.pid}\n".encode())
+            time.sleep(0.2)
+            if not process_is_monitor(process.pid):
+                raise RuntimeError("monitor_start_failed")
+            print(json.dumps({"schemaVersion": 1, "action": "Start bounded PC health monitoring", "processCompleted": True, "taskVerified": True, "pid": process.pid, "intervalSeconds": args.interval, "notifications": args.notify}, sort_keys=True))
+            return 0
+        if not PID_FILE.is_file():
+            print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": True, "message": "The PC health monitor was already stopped."}, sort_keys=True))
+            return 0
+        pid = int(PID_FILE.read_text())
+        if process_is_monitor(pid):
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(30):
+                if not process_is_monitor(pid):
+                    break
+                time.sleep(0.1)
+            if process_is_monitor(pid):
+                raise RuntimeError("monitor_stop_timeout")
+        PID_FILE.unlink()
+        print(json.dumps({"schemaVersion": 1, "action": "Stop exact PC health monitor", "processCompleted": True, "taskVerified": True, "stoppedPid": pid}, sort_keys=True))
+        return 0
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "error": str(error), "message": "PC monitoring stopped safely."}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

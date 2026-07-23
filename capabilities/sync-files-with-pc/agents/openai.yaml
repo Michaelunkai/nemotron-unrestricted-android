@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Files with PC"
+  short_description: "Safely synchronize Android and PC files"
+  default_prompt: "Use $sync-files-with-pc to synchronize this folder with my paired PC using authenticated routes and checksum verification."

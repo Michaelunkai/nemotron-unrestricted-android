@@ -1,0 +1,81 @@
+import contextlib
+import io
+import json
+import pathlib
+import runpy
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bin"))
+MODULE = runpy.run_path(str(ROOT / "bin" / "codex-ui-safe"), run_name="ui_safe_test")
+XML_BEFORE = '<hierarchy><node text="Delete" resource-id="app:id/delete" content-desc="" class="android.widget.Button" clickable="true" enabled="true" bounds="[10,20][110,80]" /></hierarchy>'
+XML_AFTER = '<hierarchy><node text="Done" resource-id="app:id/done" content-desc="" class="android.widget.TextView" clickable="false" enabled="true" bounds="[10,20][110,80]" /></hierarchy>'
+
+
+class Result:
+    def __init__(self, stdout="", status=0):
+        self.stdout = stdout
+        self.stderr = ""
+        self.remote_status = status
+        self.outer_status = 0
+        self.combined = stdout
+
+
+class UiSafeTests(unittest.TestCase):
+    def test_selector_validation_matching_and_ambiguity(self):
+        root = MODULE["ET"].fromstring(XML_BEFORE)
+        wanted = MODULE["selector"]({"resourceId": "app:id/delete", "clickable": True})
+        self.assertEqual(MODULE["center"](MODULE["find"](root, wanted)), (60, 50))
+        with self.assertRaisesRegex(Exception, "selector_invalid"):
+            MODULE["selector"]({"xpath": "//node"})
+        duplicate = MODULE["ET"].fromstring(
+            '<hierarchy><node text="x" bounds="[0,0][1,1]"/><node text="x" bounds="[1,1][2,2]"/></hierarchy>'
+        )
+        with self.assertRaisesRegex(Exception, "selector_ambiguous"):
+            MODULE["find"](duplicate, {"text": "x"})
+
+    def test_workflow_requires_postconditions_and_rejects_bad_fallback(self):
+        with self.assertRaisesRegex(Exception, "selector_invalid"):
+            MODULE["validate_spec"]([{"action": "click", "selector": {"text": "x"}}])
+        with self.assertRaisesRegex(Exception, "fallback_coordinates_invalid"):
+            MODULE["validate_spec"]([{
+                "action": "click", "fallbackCoordinates": [-1, 2], "after": {"text": "Done"},
+            }])
+
+    def test_click_uses_selector_and_verifies_after_without_real_device(self):
+        calls = []
+        snapshots = iter((XML_BEFORE, XML_AFTER))
+
+        def fake_rish(command, **_kwargs):
+            calls.append(command)
+            if command == "dumpsys activity activities":
+                return Result("topResumedActivity=ActivityRecord{} u0 com.example/.Main}")
+            if command.startswith("uiautomator dump"):
+                return Result(next(snapshots))
+            if command.startswith("input tap"):
+                return Result()
+            raise AssertionError(command)
+
+        with tempfile.TemporaryDirectory() as temp:
+            spec = pathlib.Path(temp) / "steps.json"
+            spec.write_text(json.dumps([{
+                "action": "click", "selector": {"resourceId": "app:id/delete"},
+                "after": {"resourceId": "app:id/done"}, "retries": 1,
+            }]), encoding="utf-8")
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", ["codex-ui-safe", "run", "--package", "com.example", "--spec", str(spec)]), \
+                 mock.patch.dict(MODULE["main"].__globals__, {"run_rish": fake_rish}), \
+                 contextlib.redirect_stdout(output):
+                self.assertEqual(MODULE["main"](), 0)
+            receipt = json.loads(output.getvalue())
+            self.assertTrue(receipt["taskVerified"])
+            self.assertTrue(receipt["events"][0]["postconditionVerified"])
+            self.assertIn("input tap 60 50", calls)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,210 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+EXPECTED_APP_HOME=/data/data/com.termux/files/home/nemotron-unrestricted-app
+APP_HOME="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+if [ "$APP_HOME" != "$EXPECTED_APP_HOME" ]; then
+  printf 'Refusing non-isolated rish project root.\n' >&2
+  exit 77
+fi
+
+ASSET_DIR="$APP_HOME/runtime/home/.local/lib/rish"
+ASSET_PARENT="$APP_HOME/runtime/home/.local/lib"
+RUNTIME_BIN_DIR="$APP_HOME/runtime/home/.local/bin"
+RUNTIME_LAUNCHER="$RUNTIME_BIN_DIR/rish"
+LAUNCHER_SOURCE="$APP_HOME/bin/nemotron-runtime-rish"
+LOCK_DIR="$APP_HOME/runtime/.codex/locks"
+LOCK_FILE="$LOCK_DIR/rish-assets.lock"
+PROVENANCE_DIR="$APP_HOME/runtime/.codex/supervisor"
+PROVENANCE_FILE="$PROVENANCE_DIR/rish-assets.sha256"
+
+fail_path() {
+  printf 'Refusing unsafe isolated rish path.\n' >&2
+  exit 77
+}
+
+assert_directory_chain() {
+  local target relative current old_ifs canonical component
+  target=$1
+  case "$target" in
+    "$APP_HOME"/*) ;;
+    *) fail_path ;;
+  esac
+  relative=${target#"$APP_HOME"/}
+  current=$APP_HOME
+  old_ifs=$IFS
+  IFS=/
+  set -- $relative
+  IFS=$old_ifs
+  for component in "$@"; do
+    [ -n "$component" ] || fail_path
+    [ "$component" != . ] && [ "$component" != .. ] || fail_path
+    current="$current/$component"
+    [ ! -L "$current" ] || fail_path
+    if [ -e "$current" ] && [ ! -d "$current" ]; then
+      fail_path
+    fi
+  done
+  if [ -d "$target" ]; then
+    canonical=$(CDPATH= cd -- "$target" && pwd -P)
+    [ "$canonical" = "$target" ] || fail_path
+  fi
+}
+
+ensure_directory() {
+  local target mode
+  target=$1
+  mode=$2
+  assert_directory_chain "$target"
+  mkdir -p -- "$target"
+  assert_directory_chain "$target"
+  chmod "$mode" "$target"
+}
+
+assert_file_slot() {
+  local target parent
+  target=$1
+  parent=${target%/*}
+  assert_directory_chain "$parent"
+  case "$target" in
+    "$parent"/*) ;;
+    *) fail_path ;;
+  esac
+  [ ! -L "$target" ] || fail_path
+  if [ -e "$target" ] && [ ! -f "$target" ]; then
+    fail_path
+  fi
+}
+
+valid_hash() {
+  value=$1
+  [ ${#value} -eq 64 ] || return 1
+  case "$value" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+}
+
+provenance_hash() {
+  expected_path=$1
+  awk -v expected="$expected_path" '
+    $2 == expected { count += 1; value = $1 }
+    END { if (count == 1) print value }
+  ' "$PROVENANCE_FILE"
+}
+
+runtime_assets_valid() {
+  assert_file_slot "$PROVENANCE_FILE"
+  assert_file_slot "$ASSET_DIR/rish_shizuku.dex"
+  assert_file_slot "$ASSET_DIR/librish.so"
+  assert_file_slot "$RUNTIME_LAUNCHER"
+  [ -s "$PROVENANCE_FILE" ] || return 1
+  [ -s "$ASSET_DIR/rish_shizuku.dex" ] || return 1
+  [ -s "$ASSET_DIR/librish.so" ] || return 1
+  [ -s "$RUNTIME_LAUNCHER" ] || return 1
+  dex_hash=$(provenance_hash runtime/home/.local/lib/rish/rish_shizuku.dex)
+  lib_hash=$(provenance_hash runtime/home/.local/lib/rish/librish.so)
+  launcher_hash=$(provenance_hash runtime/home/.local/bin/rish)
+  valid_hash "$dex_hash" || return 1
+  valid_hash "$lib_hash" || return 1
+  valid_hash "$launcher_hash" || return 1
+  [ "$(sha256sum "$ASSET_DIR/rish_shizuku.dex" | awk '{print $1}')" = "$dex_hash" ] || return 1
+  [ "$(sha256sum "$ASSET_DIR/librish.so" | awk '{print $1}')" = "$lib_hash" ] || return 1
+  [ "$(sha256sum "$RUNTIME_LAUNCHER" | awk '{print $1}')" = "$launcher_hash" ] || return 1
+  return 0
+}
+
+ensure_directory "$ASSET_PARENT" 700
+ensure_directory "$ASSET_DIR" 700
+ensure_directory "$RUNTIME_BIN_DIR" 700
+ensure_directory "$LOCK_DIR" 700
+ensure_directory "$PROVENANCE_DIR" 700
+assert_file_slot "$LOCK_FILE"
+exec 9>>"$LOCK_FILE"
+flock 9
+
+# A valid isolated snapshot is immutable across ordinary invocations. Do not
+# inspect protected sibling sources unless recovery/bootstrap is necessary.
+if runtime_assets_valid; then
+  exec "$RUNTIME_LAUNCHER" "$@"
+fi
+
+SOURCE_DIR=
+for candidate in \
+  /data/data/com.termux/files/home/com.michaelovsky.codexsubscription.isolated/runtime/home/.local/lib/rish \
+  /data/data/com.termux/files/home/nvidia-isolated-app/runtime/home/.local/lib/rish \
+  /data/data/com.termux/files/home/codex-subscription-isolated-app/runtime/home/.local/lib/rish \
+  /data/data/com.termux/files/home/.local/lib/rish; do
+  if [ -d "$candidate" ] && [ ! -L "$candidate" ] \
+      && [ "$(CDPATH= cd -- "$candidate" && pwd -P)" = "$candidate" ] \
+      && [ -f "$candidate/rish_shizuku.dex" ] && [ ! -L "$candidate/rish_shizuku.dex" ] \
+      && [ -f "$candidate/librish.so" ] && [ ! -L "$candidate/librish.so" ]; then
+    SOURCE_DIR=$candidate
+    break
+  fi
+done
+if [ -z "$SOURCE_DIR" ]; then
+  printf 'No verified read-only rish asset source is available.\n' >&2
+  exit 69
+fi
+
+assert_file_slot "$LAUNCHER_SOURCE"
+[ -s "$LAUNCHER_SOURCE" ] || fail_path
+source_dex_hash=$(sha256sum "$SOURCE_DIR/rish_shizuku.dex" | awk '{print $1}')
+source_lib_hash=$(sha256sum "$SOURCE_DIR/librish.so" | awk '{print $1}')
+launcher_source_hash=$(sha256sum "$LAUNCHER_SOURCE" | awk '{print $1}')
+valid_hash "$source_dex_hash"
+valid_hash "$source_lib_hash"
+valid_hash "$launcher_source_hash"
+
+STAGE_DIR=$(mktemp -d "$ASSET_PARENT/.rish-copy.XXXXXXXX")
+case "$STAGE_DIR" in
+  "$ASSET_PARENT"/.rish-copy.*) ;;
+  *) fail_path ;;
+esac
+[ -d "$STAGE_DIR" ] && [ ! -L "$STAGE_DIR" ] || fail_path
+cleanup_stage() {
+  case "$STAGE_DIR" in
+    "$ASSET_PARENT"/.rish-copy.*) find "$STAGE_DIR" -depth -delete 2>/dev/null || true ;;
+    *) printf 'Refusing unsafe rish staging cleanup path.\n' >&2 ;;
+  esac
+}
+trap cleanup_stage EXIT INT TERM
+
+cp -- "$SOURCE_DIR/rish_shizuku.dex" "$STAGE_DIR/rish_shizuku.dex"
+cp -- "$SOURCE_DIR/librish.so" "$STAGE_DIR/librish.so"
+[ "$(sha256sum "$STAGE_DIR/rish_shizuku.dex" | awk '{print $1}')" = "$source_dex_hash" ]
+[ "$(sha256sum "$STAGE_DIR/librish.so" | awk '{print $1}')" = "$source_lib_hash" ]
+chmod 400 "$STAGE_DIR/rish_shizuku.dex"
+chmod 600 "$STAGE_DIR/librish.so"
+assert_file_slot "$ASSET_DIR/rish_shizuku.dex"
+assert_file_slot "$ASSET_DIR/librish.so"
+mv -f -- "$STAGE_DIR/rish_shizuku.dex" "$ASSET_DIR/rish_shizuku.dex"
+mv -f -- "$STAGE_DIR/librish.so" "$ASSET_DIR/librish.so"
+trap - EXIT INT TERM
+cleanup_stage
+
+launcher_stage="$RUNTIME_BIN_DIR/.rish.$$.new"
+assert_file_slot "$launcher_stage"
+cp -- "$LAUNCHER_SOURCE" "$launcher_stage"
+chmod 700 "$launcher_stage"
+[ "$(sha256sum "$launcher_stage" | awk '{print $1}')" = "$launcher_source_hash" ]
+assert_file_slot "$RUNTIME_LAUNCHER"
+mv -f -- "$launcher_stage" "$RUNTIME_LAUNCHER"
+
+provenance_stage="$PROVENANCE_FILE.$$.new"
+assert_file_slot "$provenance_stage"
+{
+  printf 'source=read-only-reference-copy-v1\n'
+  printf '%s  runtime/home/.local/lib/rish/rish_shizuku.dex\n' "$source_dex_hash"
+  printf '%s  runtime/home/.local/lib/rish/librish.so\n' "$source_lib_hash"
+  printf '%s  runtime/home/.local/bin/rish\n' "$launcher_source_hash"
+} > "$provenance_stage"
+chmod 600 "$provenance_stage"
+assert_file_slot "$PROVENANCE_FILE"
+mv -f -- "$provenance_stage" "$PROVENANCE_FILE"
+
+runtime_assets_valid || {
+  printf 'Isolated rish asset verification failed.\n' >&2
+  exit 69
+}
+exec "$RUNTIME_LAUNCHER" "$@"

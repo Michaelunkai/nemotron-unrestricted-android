@@ -1,0 +1,128 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Inspect and manage safe local Nemotron automation state."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+from nemotron_automation import AutomationState
+
+
+def emit(action: str, verified: bool, **fields) -> None:
+    print(json.dumps({
+        "schemaVersion": 1,
+        "action": action,
+        "processCompleted": True,
+        "taskVerified": verified,
+        **fields,
+    }, ensure_ascii=False, sort_keys=True))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-automation",
+        description="Manage local TTL cache, circuit state, redacted logs, and metrics.",
+    )
+    parser.add_argument("--state-root", help=argparse.SUPPRESS)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("health")
+    cache = commands.add_parser("cache")
+    cache_sub = cache.add_subparsers(dest="cache_command", required=True)
+    get = cache_sub.add_parser("get")
+    get.add_argument("namespace")
+    get.add_argument("key")
+    set_command = cache_sub.add_parser("set")
+    set_command.add_argument("namespace")
+    set_command.add_argument("key")
+    set_command.add_argument("--value-json", required=True)
+    set_command.add_argument("--ttl", type=int)
+    delete = cache_sub.add_parser("delete")
+    delete.add_argument("namespace")
+    delete.add_argument("key")
+    cache_sub.add_parser("prune")
+    cache_sub.add_parser("vacuum")
+    circuit = commands.add_parser("circuit")
+    circuit_sub = circuit.add_subparsers(dest="circuit_command", required=True)
+    status = circuit_sub.add_parser("status")
+    status.add_argument("name")
+    success = circuit_sub.add_parser("success")
+    success.add_argument("name")
+    failure = circuit_sub.add_parser("failure")
+    failure.add_argument("name")
+    failure.add_argument("--error", required=True)
+    failure.add_argument("--threshold", type=int, default=5)
+    failure.add_argument("--cool-down", type=int, default=30)
+    metric = commands.add_parser("increment")
+    metric.add_argument("name")
+    metric.add_argument("--amount", type=float, default=1)
+    gauge = commands.add_parser("gauge")
+    gauge.add_argument("name")
+    gauge.add_argument("value", type=float)
+    log = commands.add_parser("log")
+    log.add_argument("level", choices=("debug", "info", "warning", "error"))
+    log.add_argument("module")
+    log.add_argument("message")
+    log.add_argument("--correlation-id")
+    args = parser.parse_args()
+    try:
+        state = AutomationState(pathlib.Path(args.state_root) if args.state_root else None) if args.state_root else AutomationState()
+        if args.command == "health":
+            state.prune()
+            state.write_metrics()
+            emit(
+                "Verify durable automation state",
+                True,
+                database=str(state.database),
+                metrics=str(state.metrics_path),
+                message="SQLite state, cache pruning, and metrics export completed successfully.",
+            )
+        elif args.command == "cache":
+            if args.cache_command == "get":
+                value = state.cache_get(args.namespace, args.key)
+                emit("Read one TTL cache value", value is not None, found=value is not None, result=value)
+            elif args.cache_command == "set":
+                state.cache_set(args.namespace, args.key, json.loads(args.value_json), args.ttl)
+                emit("Store one bounded TTL cache value", True, stored=True)
+            elif args.cache_command == "delete":
+                emit("Delete one exact cache key", True, deleted=state.cache_delete(args.namespace, args.key))
+            elif args.cache_command == "prune":
+                emit("Prune expired cache values", True, deleted=state.prune())
+            else:
+                state.vacuum()
+                emit("Compact durable automation state", True, compacted=True)
+        elif args.command == "circuit":
+            if args.circuit_command == "status":
+                emit("Read one circuit-breaker state", True, circuit=state.circuit_status(args.name))
+            elif args.circuit_command == "success":
+                state.circuit_success(args.name)
+                emit("Close one circuit after verified success", True, circuit=state.circuit_status(args.name))
+            else:
+                result = state.circuit_failure(args.name, args.error, args.threshold, args.cool_down)
+                emit("Record one classified circuit failure", True, circuit=result)
+        elif args.command == "increment":
+            state.increment(args.name, args.amount)
+            emit("Increment one local automation metric", True, metrics=str(state.metrics_path))
+        elif args.command == "gauge":
+            state.set_gauge(args.name, args.value)
+            emit("Set one local automation gauge", True, metrics=str(state.metrics_path))
+        else:
+            fields = {"correlationId": args.correlation_id} if args.correlation_id else {}
+            state.log(args.level, args.module, args.message, **fields)
+            emit("Append one redacted structured automation event", True, log=str(state.log_path))
+        return 0
+    except (ValueError, OSError, json.JSONDecodeError) as error:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "processCompleted": False,
+            "taskVerified": False,
+            "error": str(error),
+            "message": "Automation state operation stopped safely.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

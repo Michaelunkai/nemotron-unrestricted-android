@@ -1,0 +1,294 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Managed artifact provenance, quarantine, promotion, rollback, and retention."""
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+import urllib.parse
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE = pathlib.Path(os.environ.get(
+    "NEMOTRON_ARTIFACT_STATE", str(ROOT / "runtime" / ".codex" / "automation" / "managed-artifacts")
+))
+
+
+class ArtifactError(Exception):
+    pass
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def digest(path):
+    value = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+            size += len(block)
+    return value.hexdigest(), size
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def safe_source(value):
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        raise ArtifactError("source_url_invalid")
+    if parsed.username or parsed.password:
+        raise ArtifactError("source_url_credentials_forbidden")
+    return value
+
+
+class Registry:
+    def __init__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        self.lock_stream = (STATE / "registry.lock").open("a+")
+        fcntl.flock(self.lock_stream, fcntl.LOCK_EX)
+        try:
+            self.value = json.loads((STATE / "registry.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self.value = {"schemaVersion": 1, "artifacts": {}, "promotions": []}
+        except json.JSONDecodeError as error:
+            raise ArtifactError("registry_corrupt") from error
+
+    def save(self):
+        atomic_json(STATE / "registry.json", self.value)
+
+    def close(self):
+        fcntl.flock(self.lock_stream, fcntl.LOCK_UN)
+        self.lock_stream.close()
+
+
+def copy_atomic(source, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".partial")
+    try:
+        shutil.copyfile(source, temporary)
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def managed_path(record):
+    return STATE / record["managedRelativePath"]
+
+
+def require_record(registry, artifact_id):
+    record = registry.value["artifacts"].get(artifact_id)
+    if not record:
+        raise ArtifactError("artifact_not_found")
+    return record
+
+
+def receipt(**values):
+    return {"schemaVersion": 1, "processCompleted": True, "taskVerified": True, **values}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Manage artifacts with hashes, provenance, quarantine, rollback, and retention.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    add = commands.add_parser("add")
+    add.add_argument("path")
+    add.add_argument("--source-url")
+    add.add_argument("--expected-sha256")
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("id")
+    quarantine = commands.add_parser("quarantine")
+    quarantine.add_argument("id")
+    restore = commands.add_parser("restore")
+    restore.add_argument("id")
+    promote = commands.add_parser("promote")
+    promote.add_argument("id")
+    promote.add_argument("--target", required=True)
+    rollback = commands.add_parser("rollback")
+    rollback.add_argument("id")
+    prune = commands.add_parser("prune")
+    prune.add_argument("--days", type=int, default=30)
+    prune.add_argument("--apply")
+    args = parser.parse_args()
+    registry = None
+    try:
+        registry = Registry()
+        if args.command == "add":
+            source = pathlib.Path(args.path).expanduser().resolve(strict=True)
+            if not source.is_file() or source.is_symlink():
+                raise ArtifactError("artifact_must_be_regular_file")
+            sha256, size = digest(source)
+            if args.expected_sha256 and args.expected_sha256.lower() != sha256:
+                raise ArtifactError("checksum_mismatch")
+            artifact_id = sha256[:24]
+            existing = registry.value["artifacts"].get(artifact_id)
+            if existing:
+                output = receipt(action="Inspect already managed artifact", artifact=existing, deduplicated=True)
+            else:
+                relative = f"objects/{artifact_id}/{source.name}"
+                destination = STATE / relative
+                copy_atomic(source, destination)
+                copied_sha, copied_size = digest(destination)
+                if (copied_sha, copied_size) != (sha256, size):
+                    raise ArtifactError("managed_copy_verification_failed")
+                record = {
+                    "id": artifact_id, "name": source.name, "sha256": sha256, "bytes": size,
+                    "sourcePath": str(source), "sourceUrl": safe_source(args.source_url) if args.source_url else None,
+                    "managedRelativePath": relative, "state": "staged", "createdAt": now(),
+                    "promotedTargets": [],
+                }
+                registry.value["artifacts"][artifact_id] = record
+                registry.save()
+                output = receipt(action="Copy and verify artifact in managed storage", artifact=record, deduplicated=False)
+        elif args.command == "inspect":
+            record = require_record(registry, args.id)
+            path = managed_path(record)
+            current_sha, size = digest(path) if path.is_file() else (None, None)
+            verified = current_sha == record["sha256"] and size == record["bytes"]
+            if not verified:
+                raise ArtifactError("managed_artifact_verification_failed")
+            output = receipt(action="Inspect managed artifact", artifact=record, managedPath=str(path))
+        elif args.command in {"quarantine", "restore"}:
+            record = require_record(registry, args.id)
+            if args.command == "quarantine":
+                if record["state"] == "quarantined":
+                    raise ArtifactError("artifact_already_quarantined")
+                if record["promotedTargets"]:
+                    raise ArtifactError("active_artifact_cannot_be_quarantined")
+                source = managed_path(record)
+                relative = f"quarantine/{record['id']}/{record['name']}"
+                destination = STATE / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, destination)
+                record.update({"state": "quarantined", "managedRelativePath": relative, "quarantinedAt": now()})
+                action = "Quarantine the managed artifact without changing its source"
+            else:
+                if record["state"] != "quarantined":
+                    raise ArtifactError("artifact_not_quarantined")
+                source = managed_path(record)
+                relative = f"objects/{record['id']}/{record['name']}"
+                destination = STATE / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source, destination)
+                record.update({"state": "staged", "managedRelativePath": relative, "restoredAt": now()})
+                action = "Restore the quarantined managed artifact"
+            current_sha, _ = digest(destination)
+            if current_sha != record["sha256"]:
+                raise ArtifactError("artifact_transition_verification_failed")
+            registry.save()
+            output = receipt(action=action, artifact=record)
+        elif args.command == "promote":
+            record = require_record(registry, args.id)
+            if record["state"] == "quarantined":
+                raise ArtifactError("quarantined_artifact_cannot_be_promoted")
+            source = managed_path(record)
+            target = pathlib.Path(args.target).expanduser().resolve()
+            if target.is_dir() or target.is_symlink():
+                raise ArtifactError("promotion_target_invalid")
+            timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            previous = None
+            if target.exists():
+                old_sha, old_size = digest(target)
+                backup = STATE / "backups" / record["id"] / timestamp / target.name
+                copy_atomic(target, backup)
+                previous = {"path": str(backup.relative_to(STATE)), "sha256": old_sha, "bytes": old_size}
+            copy_atomic(source, target)
+            current_sha, size = digest(target)
+            if (current_sha, size) != (record["sha256"], record["bytes"]):
+                raise ArtifactError("promotion_verification_failed")
+            promotion = {
+                "artifactId": record["id"], "target": str(target), "promotedAt": now(),
+                "promotedSha256": current_sha, "previous": previous, "active": True,
+            }
+            registry.value["promotions"].append(promotion)
+            record["promotedTargets"] = sorted(set(record["promotedTargets"] + [str(target)]))
+            record["state"] = "active"
+            registry.save()
+            output = receipt(action="Promote artifact with verified target readback", promotion=promotion)
+        elif args.command == "rollback":
+            record = require_record(registry, args.id)
+            promotions = [item for item in registry.value["promotions"] if item["artifactId"] == args.id and item["active"]]
+            if not promotions:
+                raise ArtifactError("active_promotion_not_found")
+            promotion = promotions[-1]
+            target = pathlib.Path(promotion["target"])
+            if not target.is_file() or digest(target)[0] != promotion["promotedSha256"]:
+                raise ArtifactError("rollback_target_changed")
+            previous = promotion["previous"]
+            if previous:
+                backup = STATE / previous["path"]
+                copy_atomic(backup, target)
+                if digest(target)[0] != previous["sha256"]:
+                    raise ArtifactError("rollback_verification_failed")
+            else:
+                target.unlink()
+                if target.exists():
+                    raise ArtifactError("rollback_removal_failed")
+            promotion.update({"active": False, "rolledBackAt": now()})
+            record["promotedTargets"] = [value for value in record["promotedTargets"] if value != str(target)]
+            record["state"] = "active" if record["promotedTargets"] else "staged"
+            registry.save()
+            output = receipt(action="Rollback exact unchanged promoted target", restoredPrevious=bool(previous), target=str(target))
+        else:
+            if not 1 <= args.days <= 3650:
+                raise ArtifactError("retention_days_invalid")
+            cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)
+            candidates = []
+            for artifact_id, record in registry.value["artifacts"].items():
+                created = dt.datetime.fromisoformat(record["createdAt"])
+                if record["state"] == "staged" and not record["promotedTargets"] and created < cutoff:
+                    candidates.append(artifact_id)
+            plan = {"days": args.days, "artifactIds": sorted(candidates)}
+            plan_sha = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            applied = False
+            if args.apply:
+                if args.apply != plan_sha:
+                    raise ArtifactError("retention_plan_hash_mismatch")
+                for artifact_id in candidates:
+                    record = registry.value["artifacts"].pop(artifact_id)
+                    path = managed_path(record)
+                    if path.is_file() and digest(path)[0] == record["sha256"]:
+                        path.unlink()
+                registry.save()
+                applied = True
+            output = receipt(
+                action="Plan or apply retention only to inactive managed copies",
+                plan=plan, planSha256=plan_sha, applied=applied,
+            )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (ArtifactError, OSError, ValueError) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Artifact operation stopped without claiming an unsafe transition.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+    finally:
+        if registry:
+            registry.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

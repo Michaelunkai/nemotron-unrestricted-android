@@ -1,0 +1,25 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -eu
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  printf 'usage: codex-learn <lesson>\n'
+  exit 0
+fi
+
+if [ "$#" -lt 1 ]; then
+  printf 'usage: codex-learn <lesson>\n' >&2
+  exit 2
+fi
+
+RUNTIME_ROOT="${CODEX_RUNTIME_ROOT:?CODEX_RUNTIME_ROOT is required}"
+LESSON_DIR="$RUNTIME_ROOT/memory"
+LESSON_FILE="$LESSON_DIR/lessons.md"
+LOCK_FILE="$LESSON_DIR/lessons.lock"
+mkdir -p "$LESSON_DIR"
+exec 9>>"$LOCK_FILE"
+flock -x 9
+touch "$LESSON_FILE"
+if ! grep -Fqx -- "- $*" "$LESSON_FILE"; then
+  printf -- '- %s\n' "$*" >> "$LESSON_FILE"
+fi
+printf 'lesson-recorded:%s\n' "$LESSON_FILE"

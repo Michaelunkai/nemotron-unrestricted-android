@@ -1,0 +1,203 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Generate and validate opt-in Termux:Boot integration."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sys
+import tempfile
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE = ROOT / "runtime" / ".codex" / "boot"
+GENERATED = STATE / "nemotron-runtime.sh"
+MANIFEST = STATE / "manifest.json"
+ACTIVE = pathlib.Path("/data/data/com.termux/files/home/.termux/boot/nemotron-runtime.sh")
+MARKER = "# managed-by: nemotron-unrestricted codex-boot schema=1"
+VALID_PROFILES = ("ssh-agent", "pc-monitor")
+
+
+class BootError(Exception):
+    pass
+
+
+def sha256(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def atomic_write(path: pathlib.Path, content: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            destination.write(content)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def script(profiles: list[str]) -> str:
+    lines = [
+        "#!/data/data/com.termux/files/usr/bin/bash",
+        MARKER,
+        "set -u",
+        f"readonly NEMOTRON_ROOT={ROOT}",
+        'readonly NEMOTRON_BOOT_STATE="$NEMOTRON_ROOT/runtime/.codex/boot"',
+        'mkdir -p "$NEMOTRON_BOOT_STATE"',
+        'chmod 700 "$NEMOTRON_BOOT_STATE"',
+    ]
+    if "ssh-agent" in profiles:
+        lines.extend([
+            'if command -v ssh-agent >/dev/null 2>&1; then',
+            '  if [ -s "$NEMOTRON_BOOT_STATE/ssh-agent.env" ]; then',
+            '    . "$NEMOTRON_BOOT_STATE/ssh-agent.env"',
+            '  fi',
+            '  if [ -z "${SSH_AGENT_PID:-}" ] || ! kill -0 "$SSH_AGENT_PID" 2>/dev/null; then',
+            '    umask 077',
+            '    ssh-agent -s > "$NEMOTRON_BOOT_STATE/ssh-agent.env"',
+            '  fi',
+            "fi",
+        ])
+    if "pc-monitor" in profiles:
+        lines.extend([
+            'if [ -x "$NEMOTRON_ROOT/bin/codex-pc-monitor" ]; then',
+            '  "$NEMOTRON_ROOT/bin/codex-pc-monitor" start --boot >/dev/null 2>&1 || true',
+            "fi",
+        ])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def load_manifest() -> dict:
+    try:
+        value = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BootError("generated_manifest_missing_or_invalid") from error
+    if value.get("schemaVersion") != 1 or value.get("kind") != "nemotron-termux-boot":
+        raise BootError("generated_manifest_schema")
+    return value
+
+
+def status() -> dict:
+    generated = GENERATED.is_file() and not GENERATED.is_symlink()
+    active = ACTIVE.is_file() and not ACTIVE.is_symlink()
+    active_owned = active and MARKER in ACTIVE.read_text(encoding="utf-8", errors="replace")
+    manifest = None
+    if MANIFEST.is_file():
+        try:
+            manifest = load_manifest()
+        except BootError:
+            manifest = None
+    exact = bool(
+        generated and active and active_owned
+        and sha256(GENERATED) == sha256(ACTIVE)
+        and manifest and manifest.get("sha256") == sha256(GENERATED)
+    )
+    return {
+        "schemaVersion": 1,
+        "action": "Inspect opt-in Termux boot readiness",
+        "processCompleted": True,
+        "taskVerified": True,
+        "generated": generated,
+        "generatedPath": str(GENERATED),
+        "active": active,
+        "activePath": str(ACTIVE),
+        "activeOwnedByNemotron": active_owned,
+        "activeMatchesGenerated": exact,
+        "profiles": manifest.get("profiles", []) if manifest else [],
+        "message": (
+            "Boot integration is enabled and matches the exact generated script."
+            if exact else "Boot readiness was inspected; no unrelated boot script was changed."
+        ),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-boot",
+        description="Generate, inspect, enable, or disable exact Nemotron Termux:Boot integration.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    generate = commands.add_parser("generate")
+    generate.add_argument("--profile", action="append", choices=VALID_PROFILES, required=True)
+    enable = commands.add_parser("enable")
+    enable.add_argument("--confirm-sha256", required=True)
+    disable = commands.add_parser("disable")
+    disable.add_argument("--confirm-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "status":
+            print(json.dumps(status(), sort_keys=True))
+            return 0
+        if args.command == "generate":
+            profiles = sorted(set(args.profile))
+            payload = script(profiles).encode()
+            atomic_write(GENERATED, payload, 0o700)
+            digest = sha256(GENERATED)
+            atomic_write(MANIFEST, (json.dumps({
+                "schemaVersion": 1,
+                "kind": "nemotron-termux-boot",
+                "profiles": profiles,
+                "sha256": digest,
+            }, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+            print(json.dumps({
+                "schemaVersion": 1,
+                "action": "Generate inert Nemotron boot integration",
+                "processCompleted": True,
+                "taskVerified": True,
+                "path": str(GENERATED),
+                "profiles": profiles,
+                "sha256": digest,
+                "message": "Generated the boot script under isolated state; it is not active.",
+                "nextAction": "Enable only with the exact SHA-256 when persistent startup is explicitly wanted.",
+            }, sort_keys=True))
+            return 0
+        manifest = load_manifest()
+        expected = manifest["sha256"]
+        if args.confirm_sha256.lower() != expected or sha256(GENERATED) != expected:
+            raise BootError("generated_sha256_mismatch")
+        if args.command == "enable":
+            if ACTIVE.exists():
+                if ACTIVE.is_symlink() or not ACTIVE.is_file():
+                    raise BootError("active_path_unsafe")
+                if MARKER not in ACTIVE.read_text(encoding="utf-8", errors="replace"):
+                    raise BootError("unrelated_boot_script_exists")
+            atomic_write(ACTIVE, GENERATED.read_bytes(), 0o700)
+            if sha256(ACTIVE) != expected:
+                raise BootError("active_readback_mismatch")
+            print(json.dumps({**status(), "action": "Enable exact Nemotron Termux boot integration"}, sort_keys=True))
+            return 0
+        if not ACTIVE.exists():
+            print(json.dumps({**status(), "action": "Disable Nemotron Termux boot integration", "message": "The managed boot script was already absent."}, sort_keys=True))
+            return 0
+        if ACTIVE.is_symlink() or MARKER not in ACTIVE.read_text(encoding="utf-8", errors="replace"):
+            raise BootError("active_script_not_owned")
+        if sha256(ACTIVE) != expected:
+            raise BootError("active_script_changed")
+        ACTIVE.unlink()
+        print(json.dumps({**status(), "action": "Disable Nemotron Termux boot integration", "message": "Removed only the exact managed boot script."}, sort_keys=True))
+        return 0
+    except (BootError, OSError, KeyError) as error:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "processCompleted": False,
+            "taskVerified": False,
+            "error": str(error),
+            "message": "Boot integration stopped safely without changing unrelated startup files.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

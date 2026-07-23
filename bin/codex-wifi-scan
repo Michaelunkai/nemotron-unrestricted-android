@@ -1,0 +1,139 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+PROJECT_BIN="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_ROOT="$(CDPATH= cd -- "$PROJECT_BIN/.." && pwd)"
+RISH=${NEMOTRON_RISH:-/data/data/com.termux/files/home/.local/bin/rish}
+REPORTER="$PROJECT_BIN/nemotron_wifi_report.py"
+STATE_DIR=${NEMOTRON_WIFI_STATE_DIR:-$PROJECT_ROOT/runtime/.codex/supervisor}
+LOCK_FILE="$STATE_DIR/wifi-scan.lock"
+CACHE_FILE="$STATE_DIR/wifi-scan-cache"
+STAMP_FILE="$STATE_DIR/wifi-scan-refresh.epoch"
+REFRESH_SECONDS=${NEMOTRON_WIFI_REFRESH_SECONDS:-30}
+COMMAND_TIMEOUT=${NEMOTRON_WIFI_COMMAND_TIMEOUT:-10}
+RETRY_SLEEP=${NEMOTRON_WIFI_RETRY_SLEEP:-1}
+
+case "$REFRESH_SECONDS:$COMMAND_TIMEOUT:$RETRY_SLEEP" in
+  *[!0-9:]*|*::*|:*|*:) printf 'Wi-Fi timing settings must be non-negative integers.\n' >&2; exit 2 ;;
+esac
+
+umask 077
+mkdir -p "$STATE_DIR"
+
+usage() {
+  printf '%s\n' \
+    'usage: codex-wifi-scan [--refresh|--cached|--connection|--json|--raw]' \
+    'Passive Android Wi-Fi diagnostics. Refreshes are serialized and rate-limited.'
+}
+
+mode=${1:---cached}
+case "$mode" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --refresh|--cached|--connection|--json|--raw) ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [ ! -x "$RISH" ]; then
+  printf 'Wi-Fi service bridge unavailable. Run: codex-pentest doctor\n' >&2
+  exit 69
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -w 8 9; then
+  if [ -s "$CACHE_FILE" ]; then
+    "$REPORTER" --format human --source "last-known-good cache" --warning "Another Wi-Fi read is active; showing saved results." < "$CACHE_FILE"
+    exit 0
+  fi
+  printf 'Wi-Fi reader is busy and no saved result exists yet.\n' >&2
+  exit 75
+fi
+
+read_service_results() {
+  local attempt output
+  for attempt in 1 2 3; do
+    output=$(timeout "$COMMAND_TIMEOUT" "$RISH" -c 'cmd wifi list-scan-results' 2>&1) && {
+      case "$output" in
+        *BSSID*Frequency*RSSI*) printf '%s\n' "$output"; return 0 ;;
+      esac
+    }
+    [ "$attempt" -eq 3 ] || sleep $((attempt * RETRY_SLEEP))
+  done
+  return 1
+}
+
+write_cache() {
+  local payload=$1 temporary
+  temporary=$(mktemp "$STATE_DIR/.wifi-scan-cache.XXXXXXXX")
+  printf '%s\n' "$payload" > "$temporary"
+  chmod 0600 "$temporary"
+  mv "$temporary" "$CACHE_FILE"
+}
+
+if [ "$mode" = "--connection" ]; then
+  connection=$(timeout "$COMMAND_TIMEOUT" "$RISH" -c 'cmd wifi status' 2>&1) || {
+    printf 'Android Wi-Fi connection status is temporarily unavailable.\n' >&2
+    exit 69
+  }
+  printf '%s\n' "$connection" | "$REPORTER" --format connection --source "Android Wi-Fi service"
+  exit 0
+fi
+
+warning=
+source_label="Android Wi-Fi service · stable cached scan"
+payload=
+
+if [ "$mode" = "--refresh" ]; then
+  now=$(date +%s)
+  last=0
+  if [ -s "$STAMP_FILE" ]; then
+    read -r last < "$STAMP_FILE" || last=0
+  fi
+  case "$last" in *[!0-9]*|'') last=0 ;; esac
+  if [ $((now - last)) -ge "$REFRESH_SECONDS" ]; then
+    printf '%s\n' "$now" > "$STAMP_FILE"
+    if command -v termux-wifi-scaninfo >/dev/null 2>&1; then
+      api_payload=$(timeout 20 termux-wifi-scaninfo 2>/dev/null) || api_payload=
+      compact=${api_payload//$'\n'/}
+      compact=${compact//$'\r'/}
+      compact=${compact//$' '/}
+      if [ -n "$api_payload" ] && [ "$compact" != "[]" ]; then
+        payload=$api_payload
+        source_label="Termux:API · fresh passive scan"
+      else
+        warning="Android returned no fresh API entries; showing stable service results."
+      fi
+    else
+      warning="Termux:API refresh is unavailable; showing stable service results."
+    fi
+  else
+    remaining=$((REFRESH_SECONDS - (now - last)))
+    warning="Refresh safely rate-limited for ${remaining}s; showing current service results."
+  fi
+fi
+
+if [ -z "$payload" ]; then
+  payload=$(read_service_results) || payload=
+fi
+
+if [ -n "$payload" ]; then
+  write_cache "$payload"
+elif [ -s "$CACHE_FILE" ]; then
+  payload=$(<"$CACHE_FILE")
+  source_label="last-known-good cache"
+  warning="Android Wi-Fi service was temporarily unavailable; saved results were used."
+else
+  printf 'No Wi-Fi result is available after three bounded read attempts.\n' >&2
+  exit 69
+fi
+
+case "$mode" in
+  --raw) printf '%s\n' "$payload" ;;
+  --json) printf '%s\n' "$payload" | "$REPORTER" --format json --source "$source_label" ;;
+  *) printf '%s\n' "$payload" | "$REPORTER" --format human --source "$source_label" --warning "$warning" ;;
+esac

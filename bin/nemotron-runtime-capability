@@ -1,0 +1,76 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Delegate selected launcher capabilities into Nemotron's isolated runtime."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+GLOBAL_BIN = pathlib.Path("/data/data/com.termux/files/home/.local/bin")
+TRUSTED_CAPABILITY_ROOT = pathlib.Path("/data/data/com.termux/files/home/.codex/capabilities")
+ALLOWED_COMMANDS = frozenset({
+    "codex-account",
+    "codex-artifact",
+    "codex-browser",
+    "codex-capability",
+    "codex-entitlement",
+    "codex-goal",
+    "codex-job",
+    "codex-network",
+    "codex-recover",
+    "codex-ui",
+    "codex-verify",
+})
+
+
+def fail(error: str, status: int = 2) -> int:
+    print(json.dumps({
+        "ok": False,
+        "error": error,
+        "verified": False,
+        "command": "nemotron-runtime-capability",
+    }, sort_keys=True), file=sys.stderr)
+    return status
+
+
+def trusted_target(command: str) -> pathlib.Path | None:
+    launcher = GLOBAL_BIN / command
+    try:
+        resolved = launcher.resolve(strict=True)
+        trusted = TRUSTED_CAPABILITY_ROOT.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if trusted not in resolved.parents or not launcher.is_file() or not os.access(launcher, os.X_OK):
+        return None
+    return launcher
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        return fail("missing_capability_command")
+    command, arguments = sys.argv[1], sys.argv[2:]
+    if command not in ALLOWED_COMMANDS:
+        return fail("capability_command_not_allowed")
+    if arguments in (["--help"], ["-h"]):
+        print(
+            f"usage: {command} <action-or-request> [arguments]\n"
+            "Runs the verified installed launcher capability with Nemotron's "
+            "project-local CODEX_RUNTIME_ROOT."
+        )
+        return 0
+    launcher = trusted_target(command)
+    if launcher is None:
+        return fail("trusted_capability_target_unavailable", 127)
+    environment = os.environ.copy()
+    environment["CODEX_RUNTIME_ROOT"] = str(PROJECT_ROOT / "runtime" / ".codex")
+    environment["NEMOTRON_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    os.execve(str(launcher), [str(launcher), *arguments], environment)
+    return fail("capability_exec_failed", 127)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

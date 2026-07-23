@@ -1,0 +1,406 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Read-only readiness diagnostics for the Nemotron Android runtime."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import locale
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TERMUX_PREFIX = pathlib.Path("/data/data/com.termux/files/usr")
+TERMUX_HOME = pathlib.Path("/data/data/com.termux/files/home")
+APP_PACKAGE = "com.michaelovsky.nemotronunrestricted.isolated"
+TERMUX_PACKAGE = "com.termux"
+
+TOOL_GROUPS = {
+    "core": (
+        "git", "curl", "wget", "rsync", "unzip", "tar", "gzip", "bzip2",
+        "xz", "jq", "yq", "rg", "fd", "bat", "htop", "ncdu", "tree",
+        "shellcheck",
+    ),
+    "languages": (
+        "python", "pip", "pipx", "node", "npm", "yarn", "java", "javac",
+        "mvn", "gradle", "go", "rustc", "cargo",
+    ),
+    "buildSystems": (
+        "cmake", "make", "autoconf", "automake", "ninja", "bazel",
+    ),
+    "automation": (
+        "termux-job-scheduler", "termux-wake-lock", "termux-wake-unlock",
+        "crond", "at", "sqlite3",
+    ),
+    "securityAndTransfer": (
+        "gpg", "pass", "ssh", "ssh-agent", "scp", "sftp", "sshfs",
+        "smbclient", "rclone", "syncthing",
+    ),
+    "optionalIsolation": ("proot-distro", "docker", "podman"),
+    "nemotron": (
+        "codex-exec", "codex-android", "codex-gallery", "codex-download",
+        "codex-install", "codex-package", "codex-lan-discover", "codex-win",
+        "codex-wifi-scan", "codex-runtime-status",
+    ),
+}
+
+VERSION_ARGUMENTS = {
+    "java": ("-version",),
+    "javac": ("-version",),
+    "go": ("version",),
+    "npm": ("--version",),
+    "pip": ("--version",),
+    "python": ("--version",),
+}
+
+
+def run(argv: list[str], timeout: float = 5.0, maximum_output: int = 1000) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "PATH": f"{ROOT / 'bin'}:{TERMUX_PREFIX / 'bin'}:{os.environ.get('PATH', '')}"},
+        )
+        output = (result.stdout or result.stderr).strip()
+        return {
+            "completed": True,
+            "exitCode": result.returncode,
+            "output": output[:maximum_output],
+            "latencyMs": round((time.monotonic() - started) * 1000, 1),
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {
+            "completed": False,
+            "exitCode": None,
+            "output": str(error)[:1000],
+            "latencyMs": round((time.monotonic() - started) * 1000, 1),
+        }
+
+
+def executable(name: str) -> str | None:
+    project_candidate = ROOT / "bin" / name
+    if project_candidate.is_file() and os.access(project_candidate, os.X_OK):
+        return str(project_candidate)
+    return shutil.which(name)
+
+
+def toolchain_report(include_versions: bool) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    installed = 0
+    total = 0
+    for group, commands in TOOL_GROUPS.items():
+        rows = []
+        for command in commands:
+            total += 1
+            path = executable(command)
+            row: dict[str, Any] = {
+                "command": command,
+                "installed": bool(path),
+                "path": path,
+            }
+            if path:
+                installed += 1
+                if include_versions:
+                    args = VERSION_ARGUMENTS.get(command, ("--version",))
+                    proof = run([path, *args], timeout=3)
+                    row["versionProof"] = proof["output"].splitlines()[0][:240] if proof["output"] else None
+                    row["versionExitCode"] = proof["exitCode"]
+            rows.append(row)
+        groups[group] = rows
+    return {
+        "groups": groups,
+        "installedCount": installed,
+        "knownCount": total,
+        "note": (
+            "Missing optional tools are reported accurately and are not installed or "
+            "advertised automatically."
+        ),
+    }
+
+
+def sha256_file(path: pathlib.Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def freshness_report() -> dict[str, Any]:
+    apt = executable("apt")
+    apt_receipt = run([apt, "list", "--upgradable"], 15) if apt else None
+    upgradable = []
+    if apt_receipt and apt_receipt["exitCode"] == 0:
+        upgradable = [
+            line for line in apt_receipt["output"].splitlines()
+            if line and not line.startswith("Listing")
+        ]
+    runtime_versions = []
+    for command in ("python", "pip", "node", "npm", "java", "javac", "go", "rustc", "cargo", "git"):
+        path = executable(command)
+        if not path:
+            runtime_versions.append({"command": command, "installed": False})
+            continue
+        proof = run([path, *VERSION_ARGUMENTS.get(command, ("--version",))], 5)
+        runtime_versions.append({
+            "command": command,
+            "installed": True,
+            "path": path,
+            "version": proof["output"].splitlines()[0][:240] if proof["output"] else None,
+            "exitCode": proof["exitCode"],
+        })
+    project_tools = []
+    for path in sorted((ROOT / "bin").iterdir()):
+        if path.is_file() and os.access(path, os.X_OK):
+            project_tools.append({
+                "command": path.name,
+                "sha256": sha256_file(path),
+                "modifiedAt": dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc).isoformat(),
+            })
+    git_path = executable("git")
+    revision = run([git_path, "rev-parse", "HEAD"], 5) if git_path else None
+    status = run([git_path, "status", "--short"], 5) if git_path else None
+    return {
+        "packageIndexRefreshed": False,
+        "upgradableFromCurrentIndex": upgradable,
+        "upgradableCount": len(upgradable),
+        "runtimeVersions": runtime_versions,
+        "projectTools": project_tools,
+        "repositoryRevision": revision["output"] if revision and revision["exitCode"] == 0 else None,
+        "workingTreeChangeCount": len(status["output"].splitlines()) if status and status["output"] else 0,
+        "rule": (
+            "This report uses only the existing local package index. It does not refresh "
+            "repositories, contact language registries, install, remove, or upgrade anything."
+        ),
+    }
+
+
+def path_row(label: str, path: pathlib.Path) -> dict[str, Any]:
+    exists = path.exists()
+    return {
+        "label": label,
+        "path": str(path),
+        "exists": exists,
+        "isDirectory": path.is_dir() if exists else False,
+        "isSymlink": path.is_symlink(),
+        "writable": os.access(path, os.W_OK) if exists else False,
+        "target": str(path.resolve()) if path.is_symlink() else None,
+    }
+
+
+def environment_report() -> dict[str, Any]:
+    runtime_home = pathlib.Path(os.environ.get("HOME", str(ROOT / "runtime" / "home")))
+    codex_home = pathlib.Path(os.environ.get("CODEX_HOME", str(ROOT / "runtime" / ".codex")))
+    storage = runtime_home / "storage"
+    try:
+        locale_name = locale.setlocale(locale.LC_CTYPE)
+    except locale.Error:
+        locale_name = None
+    timezone = os.environ.get("TZ")
+    if not timezone:
+        local_now = dt.datetime.now().astimezone()
+        timezone = str(local_now.tzinfo)
+    paths = [
+        path_row("project", ROOT),
+        path_row("runtimeHome", runtime_home),
+        path_row("codexHome", codex_home),
+        path_row("workspace", ROOT / "workspace"),
+        path_row("storage", storage),
+        path_row("downloads", storage / "downloads"),
+        path_row("pictures", storage / "pictures"),
+        path_row("shared", storage / "shared"),
+    ]
+    return {
+        "locale": locale_name,
+        "localeEnvironment": {
+            key: os.environ.get(key) for key in ("LANG", "LC_ALL", "LC_CTYPE")
+        },
+        "timezone": timezone,
+        "shell": os.environ.get("SHELL"),
+        "termuxPrefix": str(TERMUX_PREFIX),
+        "termuxHome": str(TERMUX_HOME),
+        "paths": paths,
+        "healthy": all(row["exists"] and row["writable"] for row in paths[:4]),
+    }
+
+
+def read_first(path: pathlib.Path, limit: int = 64_000) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except OSError:
+        return None
+
+
+def performance_report() -> dict[str, Any]:
+    memory: dict[str, int] = {}
+    raw_memory = read_first(pathlib.Path("/proc/meminfo"))
+    if raw_memory:
+        for line in raw_memory.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            pieces = value.strip().split()
+            if pieces and pieces[0].isdigit():
+                memory[key] = int(pieces[0])
+    disk = shutil.disk_usage(ROOT)
+    zram = []
+    for device in sorted(pathlib.Path("/sys/block").glob("zram*")):
+        size = read_first(device / "disksize")
+        zram.append({"device": device.name, "bytes": int(size.strip()) if size and size.strip().isdigit() else None})
+    thermal = []
+    for zone in sorted(pathlib.Path("/sys/class/thermal").glob("thermal_zone*"))[:32]:
+        temperature = read_first(zone / "temp")
+        kind = read_first(zone / "type")
+        if temperature and temperature.strip().lstrip("-").isdigit():
+            thermal.append({
+                "zone": zone.name,
+                "type": kind.strip() if kind else None,
+                "milliCelsius": int(temperature.strip()),
+            })
+    return {
+        "cpuCount": os.cpu_count(),
+        "memoryKiB": {key: memory.get(key) for key in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")},
+        "projectFilesystem": {
+            "totalBytes": disk.total,
+            "usedBytes": disk.used,
+            "freeBytes": disk.free,
+        },
+        "zram": zram,
+        "thermal": thermal,
+        "recommendation": (
+            "No memory, swap, thermal, or storage setting was changed. Optional tuning "
+            "must remain device- and privilege-aware."
+        ),
+    }
+
+
+def parse_json_output(receipt: dict[str, Any]) -> Any:
+    if receipt["exitCode"] != 0 or not receipt["output"]:
+        return None
+    try:
+        return json.loads(receipt["output"])
+    except json.JSONDecodeError:
+        return None
+
+
+def android_report() -> dict[str, Any]:
+    shizuku_path = executable("codex-shizuku")
+    package_path = executable("codex-package")
+    battery_path = executable("codex-battery")
+    storage_path = executable("codex-storage")
+    shizuku = run([shizuku_path, "status"], 8) if shizuku_path else None
+    app = run([package_path, "inspect", APP_PACKAGE], 12) if package_path else None
+    termux = run([package_path, "inspect", TERMUX_PACKAGE], 12) if package_path else None
+    battery = run([battery_path, "status"], 20) if battery_path else None
+    storage = run([storage_path, "status"], 10, 20_000) if storage_path else None
+    battery_json = parse_json_output(battery) if battery else None
+    storage_json = parse_json_output(storage) if storage else None
+    return {
+        "shizuku": parse_json_output(shizuku) if shizuku else None,
+        "shizukuReceipt": shizuku,
+        "packages": {
+            "nemotron": parse_json_output(app) if app else None,
+            "termux": parse_json_output(termux) if termux else None,
+        },
+        "batteryOptimization": {
+            "readSucceeded": bool(battery_json and battery_json.get("taskVerified")),
+            "nemotronExempt": bool(battery_json and battery_json.get("after", {}).get(APP_PACKAGE)),
+            "termuxExempt": bool(battery_json and battery_json.get("after", {}).get(TERMUX_PACKAGE)),
+            "note": "Read-only check; no exemption or Android setting was changed.",
+        },
+        "storageMappings": storage_json.get("links", []) if storage_json else [],
+        "storageMappingsVerified": bool(storage_json and storage_json.get("taskVerified")),
+        "permissionRule": (
+            "An installed command is not proof of hardware, permission, foreground, or "
+            "user-consent readiness; each action must verify its own gate."
+        ),
+    }
+
+
+def human(receipt: dict[str, Any]) -> str:
+    lines = [
+        receipt["message"],
+        f"Verification: {'passed' if receipt['taskVerified'] else 'incomplete'} (read-only).",
+    ]
+    if "environment" in receipt:
+        env = receipt["environment"]
+        lines.append(f"Environment: locale {env['locale'] or 'unknown'}, timezone {env['timezone']}, core paths {'ready' if env['healthy'] else 'need attention'}.")
+    if "toolchain" in receipt:
+        tools = receipt["toolchain"]
+        lines.append(f"Toolchain: {tools['installedCount']} of {tools['knownCount']} known commands are installed; optional gaps remain explicit.")
+    if "freshness" in receipt:
+        freshness = receipt["freshness"]
+        lines.append(
+            f"Freshness: the current local package index reports {freshness['upgradableCount']} "
+            "upgrade(s); no registry was contacted and no package was changed."
+        )
+    if "performance" in receipt:
+        perf = receipt["performance"]
+        lines.append(f"Performance: {perf['cpuCount']} CPUs; {perf['projectFilesystem']['freeBytes']} bytes free; {len(perf['zram'])} zram device(s) detected.")
+    if "android" in receipt:
+        battery = receipt["android"]["batteryOptimization"]
+        lines.append(f"Android: battery-optimization state read {'successfully' if battery['readSucceeded'] else 'was unavailable'}; no setting was changed.")
+    lines.append(receipt["nextAction"])
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-doctor",
+        description="Read-only Nemotron environment, toolchain, Android, and performance diagnostics.",
+    )
+    parser.add_argument(
+        "scope",
+        nargs="?",
+        choices=("all", "environment", "toolchain", "freshness", "android", "performance"),
+        default="all",
+    )
+    parser.add_argument("--versions", action="store_true", help="Run bounded local version probes for installed tools.")
+    parser.add_argument("--json", action="store_true", help="Print the complete structured receipt.")
+    args = parser.parse_args()
+
+    receipt: dict[str, Any] = {
+        "schemaVersion": 1,
+        "action": f"Inspect {args.scope} readiness without changing the device",
+        "scope": args.scope,
+        "processCompleted": True,
+        "taskVerified": True,
+        "observedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    if args.scope in {"all", "environment"}:
+        receipt["environment"] = environment_report()
+    if args.scope in {"all", "toolchain"}:
+        receipt["toolchain"] = toolchain_report(args.versions)
+    if args.scope in {"all", "freshness"}:
+        receipt["freshness"] = freshness_report()
+    if args.scope in {"all", "performance"}:
+        receipt["performance"] = performance_report()
+    if args.scope in {"all", "android"}:
+        receipt["android"] = android_report()
+    receipt["message"] = f"Completed the read-only {args.scope} readiness inspection."
+    receipt["nextAction"] = (
+        "Use the reported installed paths and exact gates when planning work; install or "
+        "change only a specifically required optional component with rollback and verification."
+    )
+    print(json.dumps(receipt, ensure_ascii=False, sort_keys=True) if args.json else human(receipt))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "release": "v1.4.0",
+  "androidVersionCode": 5,
+  "package": "com.michaelovsky.nemotronunrestricted.isolated",
+  "asset": {
+    "name": "Nemotron-Unrestricted-1.4.0.apk",
+    "bytes": 292402,
+    "sha256": "4e3aa0c48e945221167ee8314c29813a31112b756a00e40b9b188804b5f9ac42",
+    "signerSha256": "f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f",
+    "signatureSchemes": ["v1", "v2", "v3"]
+  },
+  "verification": {
+    "automatedTests": 343,
+    "sourceValidation": true,
+    "secretScan": true,
+    "installedBytesMatch": true,
+    "preservationVerified": true,
+    "privateAndroidWebViewProof": true,
+    "physicalForegroundUsed": false
+  }
+}

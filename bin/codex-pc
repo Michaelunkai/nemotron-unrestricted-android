@@ -1,0 +1,119 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Typed quote-safe front end for paired Windows read-only work."""
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+from nemotron_automation import safe_mode_status
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WIN = os.environ.get("NEMOTRON_CODEX_WIN", str(ROOT / "bin" / "codex-win"))
+
+
+def call(payload, fresh=False, timeout=60):
+    arguments = [WIN, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), "--timeout", str(timeout)]
+    if fresh:
+        arguments.append("--fresh")
+    return subprocess.run(arguments, cwd=ROOT, capture_output=True, text=True, timeout=timeout + 20, check=False)
+
+
+def classify(result):
+    text = result.stderr.strip()
+    try:
+        error = json.loads(text)
+    except json.JSONDecodeError:
+        error = {}
+    code = error.get("error")
+    if result.returncode == 64:
+        category = "policy"
+    elif code in {"windows_gateway_circuit_open"}:
+        category = "transport"
+    elif code in {"windows_gateway_unverified"}:
+        category = "identity"
+    elif "timeout" in text.lower() or "did not answer" in text.lower():
+        category = "transport"
+    elif result.returncode:
+        category = "process"
+    else:
+        category = None
+    return category, error
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-pc",
+        description="Run typed paired-PC status, diagnostics, or read-only PowerShell queries.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("status", "diagnostics"):
+        child = commands.add_parser(name)
+        child.add_argument("--fresh", action="store_true")
+        child.add_argument("--timeout", type=int, default=5)
+    query = commands.add_parser("query")
+    query.add_argument("--command", dest="powershell_command", required=True)
+    query.add_argument("--timeout", type=int, default=60)
+    query.add_argument("--require-output", action="store_true")
+    query.add_argument("--expect-json-field")
+    query.add_argument("--expect-json-value")
+    args = parser.parse_args()
+    if safe_mode_status()["active"]:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "failureCategory": "policy", "error": "local_only_safe_mode_active",
+            "message": "Paired-PC networking is disabled while local-only safe mode is active.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+    if not 1 <= args.timeout <= 600:
+        parser.error("timeout must be between 1 and 600 seconds")
+    payload = {"action": args.command} if args.command != "query" else {
+        "action": "powershell", "command": args.powershell_command,
+    }
+    result = call(payload, getattr(args, "fresh", False), args.timeout)
+    category, error = classify(result)
+    if category:
+        print(json.dumps({
+            "schemaVersion": 1, "action": "Run a typed paired-PC request",
+            "processCompleted": False, "taskVerified": False,
+            "failureCategory": category,
+            "error": error.get("error", "pc_request_failed"),
+            "message": error.get("message", "The paired-PC request stopped without a verified result."),
+            "nextAction": error.get("nextAction", "Run fresh status and diagnostics before a bounded retry."),
+        }, sort_keys=True), file=sys.stderr)
+        return result.returncode or 2
+    try:
+        receipt = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "failureCategory": "transport", "error": "pc_receipt_invalid"}, sort_keys=True), file=sys.stderr)
+        return 2
+    if receipt.get("verified") is not True:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": False, "failureCategory": "identity", "error": "pc_identity_unverified"}, sort_keys=True), file=sys.stderr)
+        return 5
+    if args.command == "query":
+        output = receipt.get("stdout", "")
+        if args.require_output and not output.strip():
+            print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": False, "failureCategory": "postcondition", "error": "required_output_empty"}, sort_keys=True), file=sys.stderr)
+            return 7
+        if args.expect_json_field:
+            try:
+                value = json.loads(output)
+            except json.JSONDecodeError:
+                value = None
+            expected = args.expect_json_value
+            if not isinstance(value, dict) or str(value.get(args.expect_json_field)) != expected:
+                print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": False, "failureCategory": "postcondition", "error": "json_postcondition_mismatch"}, sort_keys=True), file=sys.stderr)
+                return 7
+    receipt["taskVerified"] = True
+    receipt["failureCategory"] = None
+    receipt["message"] = receipt.get("message") or "The typed paired-PC request and its receipt were verified."
+    print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

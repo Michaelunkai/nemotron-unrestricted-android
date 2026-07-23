@@ -1,0 +1,344 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Validate and run resumable verified JSON/YAML automation tasks."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+import yaml
+
+from nemotron_automation import DEFAULT_STATE, atomic_write
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+EXEC = ROOT / "bin" / "codex-exec"
+STATE_ROOT = DEFAULT_STATE / "tasks"
+SAFE_ID = re.compile(r"[A-Za-z0-9_.-]{1,80}\Z")
+
+
+class TaskError(Exception):
+    pass
+
+
+def load(path: pathlib.Path) -> dict:
+    path = path.resolve(strict=True)
+    if path.is_symlink() or path.stat().st_size > 256 * 1024:
+        raise TaskError("task_file_invalid")
+    try:
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise TaskError("task_parse_failed") from error
+    if not isinstance(value, dict):
+        raise TaskError("task_object_required")
+    return value
+
+
+def clean_text(value, field, maximum=240):
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise TaskError(f"{field}_invalid")
+    if any(ord(character) < 32 for character in value):
+        raise TaskError(f"{field}_control_character")
+    return value.strip()
+
+
+def validate_verification(value: object, field: str = "step_verify") -> dict:
+    if not isinstance(value, dict):
+        raise TaskError(field + "_invalid")
+    kind = value.get("type")
+    if kind == "json-stdout":
+        if set(value) != {"type", "required"}:
+            raise TaskError(field + "_invalid")
+        required = value.get("required")
+        if not isinstance(required, dict) or not required or len(required) > 64:
+            raise TaskError(field + "_invalid")
+        for key in required:
+            clean_text(key, field + "_key", 128)
+        return {"type": kind, "required": required}
+    if kind == "file":
+        if set(value) - {"type", "path", "sha256"} or "path" not in value:
+            raise TaskError(field + "_invalid")
+        path = clean_text(value.get("path"), field + "_path", 4096)
+        normalized = {"type": kind, "path": path}
+        if "sha256" in value:
+            checksum = clean_text(value.get("sha256"), field + "_sha256", 64).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+                raise TaskError(field + "_invalid")
+            normalized["sha256"] = checksum
+        return normalized
+    raise TaskError(field + "_invalid")
+
+
+def validate(payload: dict) -> dict:
+    allowed = {"schemaVersion", "id", "title", "description", "steps"}
+    if set(payload) - allowed or payload.get("schemaVersion") != 1:
+        raise TaskError("task_schema_invalid")
+    task_id = clean_text(payload.get("id"), "task_id", 80)
+    if not SAFE_ID.fullmatch(task_id):
+        raise TaskError("task_id_invalid")
+    title = clean_text(payload.get("title"), "title")
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 64:
+        raise TaskError("steps_invalid")
+    seen = set()
+    normalized = []
+    for position, raw in enumerate(steps):
+        if not isinstance(raw, dict):
+            raise TaskError("step_object_required")
+        allowed_step = {
+            "id", "purpose", "program", "args", "script", "cwd", "timeoutSeconds",
+            "retry", "verify", "mutation", "requiresConsent", "rollback",
+        }
+        if set(raw) - allowed_step:
+            raise TaskError("step_fields_invalid")
+        step_id = clean_text(raw.get("id"), "step_id", 80)
+        if not SAFE_ID.fullmatch(step_id) or step_id in seen:
+            raise TaskError("step_id_invalid")
+        seen.add(step_id)
+        has_program = "program" in raw
+        has_script = "script" in raw
+        if has_program == has_script:
+            raise TaskError("step_execution_shape")
+        purpose = clean_text(raw.get("purpose"), "purpose")
+        args = raw.get("args", [])
+        if not isinstance(args, list) or len(args) > 256 or any(not isinstance(arg, str) or "\0" in arg for arg in args):
+            raise TaskError("step_args_invalid")
+        timeout = raw.get("timeoutSeconds", 120)
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 900:
+            raise TaskError("step_timeout_invalid")
+        retry_spec = raw.get("retry", {"attempts": 1, "safe": False})
+        if not isinstance(retry_spec, dict) or set(retry_spec) - {"attempts", "safe"}:
+            raise TaskError("step_retry_invalid")
+        attempts = retry_spec.get("attempts", 1)
+        retry_safe = retry_spec.get("safe", False)
+        if not isinstance(attempts, int) or not 1 <= attempts <= 3 or not isinstance(retry_safe, bool):
+            raise TaskError("step_retry_invalid")
+        if attempts > 1 and not retry_safe:
+            raise TaskError("step_retry_safety_required")
+        verify = validate_verification(raw.get("verify"))
+        mutation = raw.get("mutation", False)
+        consent = raw.get("requiresConsent", False)
+        if not isinstance(mutation, bool) or not isinstance(consent, bool):
+            raise TaskError("step_safety_flags_invalid")
+        rollback = raw.get("rollback")
+        if rollback is not None:
+            if not isinstance(rollback, dict) or set(rollback) - {"purpose", "program", "args", "verify"}:
+                raise TaskError("rollback_invalid")
+            clean_text(rollback.get("purpose"), "rollback_purpose")
+            clean_text(rollback.get("program"), "rollback_program", 4096)
+            rollback_args = rollback.get("args", [])
+            if (
+                not isinstance(rollback_args, list)
+                or len(rollback_args) > 256
+                or any(not isinstance(arg, str) or "\0" in arg for arg in rollback_args)
+            ):
+                raise TaskError("rollback_invalid")
+            rollback = {
+                **rollback,
+                "args": rollback_args,
+                "verify": validate_verification(rollback.get("verify"), "rollback_verify"),
+            }
+        normalized.append({
+            **raw,
+            "id": step_id,
+            "purpose": purpose,
+            "args": args,
+            "timeoutSeconds": timeout,
+            "retry": {"attempts": attempts, "safe": retry_safe},
+            "verify": verify,
+            "mutation": mutation,
+            "requiresConsent": consent,
+            **({"rollback": rollback} if rollback is not None else {}),
+        })
+    return {
+        "schemaVersion": 1,
+        "id": task_id,
+        "title": title,
+        "description": str(payload.get("description", ""))[:2000],
+        "steps": normalized,
+    }
+
+
+def state_path(task_id: str) -> pathlib.Path:
+    return STATE_ROOT / f"{task_id}.json"
+
+
+def write_state(state: dict) -> None:
+    atomic_write(state_path(state["taskId"]), (json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+
+
+def emit(event: str, **fields) -> None:
+    print(json.dumps({"schemaVersion": 1, "event": event, "atEpoch": int(time.time()), **fields}, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def request_for(step: dict) -> dict:
+    request = {
+        "schemaVersion": 1,
+        "purpose": step["purpose"],
+        "args": step["args"],
+        "timeoutSeconds": step["timeoutSeconds"],
+        "retries": step["retry"]["attempts"] - 1,
+        "retrySafe": step["retry"]["safe"],
+        "verify": step["verify"],
+        "wakeLock": step["timeoutSeconds"] >= 60,
+    }
+    for key in ("program", "script", "cwd"):
+        if key in step:
+            request[key] = step[key]
+    return request
+
+
+def execute_step(task_id: str, step: dict) -> dict:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, name = tempfile.mkstemp(prefix=f".{task_id}-{step['id']}.", suffix=".json", dir=STATE_ROOT)
+    request_path = pathlib.Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+            json.dump(request_for(step), destination)
+        os.chmod(request_path, 0o600)
+        process = subprocess.Popen(
+            [str(EXEC), "--request", str(request_path)],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        while process.poll() is None:
+            state = json.loads(state_path(task_id).read_text(encoding="utf-8"))
+            if state.get("cancelRequested"):
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5)
+                raise TaskError("task_cancelled")
+            time.sleep(0.2)
+        stdout, stderr = process.communicate()
+        try:
+            receipt = json.loads(stdout)
+        except json.JSONDecodeError as error:
+            raise TaskError("step_receipt_invalid") from error
+        receipt["technicalStderr"] = stderr[-4000:]
+        if process.returncode != 0 or receipt.get("taskVerified") is not True:
+            raise TaskError(f"step_failed:{step['id']}:{receipt.get('error', receipt.get('verification', 'unverified'))}")
+        return receipt
+    finally:
+        if request_path.exists() and request_path.parent == STATE_ROOT:
+            request_path.unlink()
+
+
+def run_task(task: dict, approved: set[str], resume: bool) -> int:
+    path = state_path(task["id"])
+    if resume:
+        if not path.is_file() or path.is_symlink():
+            raise TaskError("resume_state_missing")
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if state.get("status") not in {"failed", "cancelled", "running"}:
+            raise TaskError("resume_state_terminal")
+        state["cancelRequested"] = False
+        start = state.get("nextStep", 0)
+    else:
+        if path.exists():
+            prior = json.loads(path.read_text(encoding="utf-8"))
+            if prior.get("status") in {"running", "completed"}:
+                raise TaskError("task_state_exists")
+        start = 0
+        state = {
+            "schemaVersion": 1, "taskId": task["id"], "title": task["title"],
+            "status": "running", "nextStep": 0, "completedSteps": [],
+            "cancelRequested": False, "receipts": [],
+        }
+    write_state(state)
+    emit("task-started", taskId=task["id"], title=task["title"], nextStep=start, totalSteps=len(task["steps"]))
+    try:
+        for index in range(start, len(task["steps"])):
+            step = task["steps"][index]
+            if step["requiresConsent"] and step["id"] not in approved:
+                raise TaskError(f"consent_required:{step['id']}")
+            state["status"] = "running"
+            state["nextStep"] = index
+            write_state(state)
+            emit("step-started", taskId=task["id"], stepId=step["id"], purpose=step["purpose"], position=index + 1, totalSteps=len(task["steps"]))
+            receipt = execute_step(task["id"], step)
+            state["completedSteps"].append(step["id"])
+            state["receipts"].append({
+                "stepId": step["id"], "taskVerified": True,
+                "verification": receipt.get("verification"),
+                "durationMs": receipt.get("durationMs"),
+            })
+            state["nextStep"] = index + 1
+            write_state(state)
+            emit("step-completed", taskId=task["id"], stepId=step["id"], result=receipt.get("verification"))
+        state["status"] = "completed"
+        write_state(state)
+        emit("task-completed", taskId=task["id"], taskVerified=True, completedSteps=state["completedSteps"])
+        return 0
+    except TaskError as error:
+        state["status"] = "cancelled" if str(error) == "task_cancelled" else "failed"
+        state["error"] = str(error)
+        write_state(state)
+        emit("task-stopped", taskId=task["id"], taskVerified=False, status=state["status"], error=str(error))
+        return 2
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-task",
+        description="Validate, dry-run, run, resume, inspect, or cancel verified JSON/YAML tasks.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("validate", "dry-run"):
+        child = commands.add_parser(name)
+        child.add_argument("file")
+    for name in ("run", "resume"):
+        child = commands.add_parser(name)
+        child.add_argument("file")
+        child.add_argument("--approve", action="append", default=[])
+    status = commands.add_parser("status")
+    status.add_argument("task_id")
+    cancel = commands.add_parser("cancel")
+    cancel.add_argument("task_id")
+    args = parser.parse_args()
+    try:
+        if args.command in {"status", "cancel"}:
+            if not SAFE_ID.fullmatch(args.task_id):
+                raise TaskError("task_id_invalid")
+            path = state_path(args.task_id)
+            if not path.is_file() or path.is_symlink():
+                raise TaskError("task_state_missing")
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if args.command == "cancel":
+                if state.get("status") != "running":
+                    raise TaskError("task_not_running")
+                state["cancelRequested"] = True
+                write_state(state)
+            emit(f"task-{args.command}", taskId=args.task_id, taskVerified=True, state=state)
+            return 0
+        task = validate(load(pathlib.Path(args.file)))
+        if args.command == "validate":
+            emit("task-validated", taskId=task["id"], taskVerified=True, stepCount=len(task["steps"]))
+            return 0
+        if args.command == "dry-run":
+            emit("task-dry-run", taskId=task["id"], taskVerified=True, title=task["title"], steps=[
+                {"id": step["id"], "purpose": step["purpose"], "mutation": step["mutation"], "requiresConsent": step["requiresConsent"], "hasRollback": bool(step.get("rollback"))}
+                for step in task["steps"]
+            ])
+            return 0
+        approved = set(args.approve)
+        if approved - {step["id"] for step in task["steps"]}:
+            raise TaskError("unknown_approval")
+        return run_task(task, approved, args.command == "resume")
+    except (TaskError, OSError, json.JSONDecodeError) as error:
+        emit("task-error", taskVerified=False, error=str(error))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

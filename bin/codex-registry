@@ -1,0 +1,178 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Manifest-only skill, plugin, and command capability registry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import time
+
+import yaml
+
+from nemotron_automation import DEFAULT_STATE, atomic_write
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SKILL_ROOTS = (
+    ROOT / "capabilities",
+    pathlib.Path("/data/data/com.termux/files/home/.codex/skills"),
+)
+PLUGIN_ROOT = pathlib.Path("/data/data/com.termux/files/home/.codex/plugins/cache")
+OUTPUT = DEFAULT_STATE / "capability-registry.json"
+MAX_FILE = 512 * 1024
+MAX_ITEMS = 1000
+
+
+class RegistryError(Exception):
+    pass
+
+
+def contained(path, root):
+    resolved = path.resolve()
+    base = root.resolve()
+    return resolved == base or base in resolved.parents
+
+
+def skill(path, root):
+    if path.is_symlink() or not path.is_file() or not contained(path, root) or path.stat().st_size > MAX_FILE:
+        raise RegistryError(f"skill_path_invalid:{path}")
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n") or "\n---\n" not in text[4:]:
+        raise RegistryError(f"skill_frontmatter_missing:{path}")
+    header = text.split("\n---\n", 1)[0][4:]
+    metadata = yaml.safe_load(header)
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str) or not isinstance(metadata.get("description"), str):
+        raise RegistryError(f"skill_frontmatter_invalid:{path}")
+    return {
+        "name": metadata["name"][:160],
+        "description": metadata["description"][:1000],
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "source": "project" if root == ROOT / "capabilities" else "installed",
+    }
+
+
+def plugin(path):
+    if path.is_symlink() or not path.is_file() or not contained(path, PLUGIN_ROOT) or path.stat().st_size > MAX_FILE:
+        raise RegistryError(f"plugin_path_invalid:{path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RegistryError(f"plugin_json_invalid:{path}") from error
+    name = value.get("name")
+    version = value.get("version")
+    description = value.get("description")
+    if not all(isinstance(item, str) and item for item in (name, version, description)):
+        raise RegistryError(f"plugin_identity_invalid:{path}")
+    root = path.parent.parent
+    skills = value.get("skills")
+    skills_path = None
+    if skills is not None:
+        if not isinstance(skills, str):
+            raise RegistryError(f"plugin_skills_invalid:{path}")
+        skills_path = (root / skills).resolve()
+        if not contained(skills_path, root) or not skills_path.is_dir():
+            raise RegistryError(f"plugin_skills_path_invalid:{path}")
+    return {
+        "name": name[:160], "version": version[:120],
+        "description": description[:1000], "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "skillsPath": str(skills_path) if skills_path else None,
+        "hasAppManifest": isinstance(value.get("apps"), str),
+        "declaredCapabilities": value.get("interface", {}).get("capabilities", [])
+        if isinstance(value.get("interface"), dict) else [],
+    }
+
+
+def refresh():
+    skills = []
+    errors = []
+    paths = []
+    for root in SKILL_ROOTS:
+        if root.is_dir():
+            paths.extend((path, root) for path in root.rglob("SKILL.md"))
+    if len(paths) > MAX_ITEMS:
+        raise RegistryError("skill_count_limit")
+    for path, root in sorted(paths):
+        try:
+            skills.append(skill(path, root))
+        except (OSError, UnicodeError, yaml.YAMLError, RegistryError) as error:
+            errors.append(str(error))
+    plugin_paths = list(PLUGIN_ROOT.rglob("plugin.json")) if PLUGIN_ROOT.is_dir() else []
+    if len(plugin_paths) > MAX_ITEMS:
+        raise RegistryError("plugin_count_limit")
+    plugins = []
+    for path in sorted(plugin_paths):
+        try:
+            plugins.append(plugin(path))
+        except (OSError, UnicodeError, RegistryError) as error:
+            errors.append(str(error))
+    commands = {}
+    matrix = json.loads((ROOT / "capabilities" / "capability-matrix.json").read_text(encoding="utf-8"))
+    for capability in matrix.get("capabilities", []):
+        for command in capability.get("commands", []):
+            commands[command] = shutil.which(command)
+    payload = {
+        "schemaVersion": 1, "generatedAtEpoch": int(time.time()),
+        "skills": skills, "plugins": plugins,
+        "commands": [{"name": name, "path": path, "installed": bool(path)} for name, path in sorted(commands.items())],
+        "validationErrors": errors,
+        "executionRule": "Registry discovery reads manifests and documentation only; it never imports or executes discovered scripts, hooks, binaries, or plugin code.",
+    }
+    atomic_write(OUTPUT, (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+    return payload
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-registry",
+        description="Refresh, inspect, or search the manifest-only all-model capability registry.",
+    )
+    parser.add_argument("command", choices=("refresh", "status", "search"))
+    parser.add_argument("query", nargs="?")
+    args = parser.parse_args()
+    try:
+        if args.command == "refresh":
+            payload = refresh()
+        else:
+            if not OUTPUT.is_file() or OUTPUT.is_symlink():
+                raise RegistryError("registry_missing")
+            payload = json.loads(OUTPUT.read_text(encoding="utf-8"))
+        if args.command == "search":
+            if not args.query:
+                raise RegistryError("query_required")
+            query = args.query.casefold()
+            results = []
+            for kind in ("skills", "plugins", "commands"):
+                for item in payload.get(kind, []):
+                    if query in json.dumps(item, ensure_ascii=False).casefold():
+                        results.append({"kind": kind[:-1], **item})
+            body = {"results": results, "count": len(results)}
+        else:
+            body = {
+                "skillCount": len(payload["skills"]), "pluginCount": len(payload["plugins"]),
+                "commandCount": len(payload["commands"]),
+                "installedCommandCount": sum(row["installed"] for row in payload["commands"]),
+                "validationErrors": payload["validationErrors"],
+                "executionRule": payload["executionRule"],
+            }
+        print(json.dumps({
+            "schemaVersion": 1, "action": f"{args.command.title()} manifest-only capability registry",
+            "processCompleted": True, "taskVerified": not payload["validationErrors"],
+            **body,
+            "message": "Capability manifests were read without executing discovered code.",
+        }, ensure_ascii=False, sort_keys=True))
+        return 0 if not payload["validationErrors"] else 3
+    except (OSError, RegistryError, json.JSONDecodeError) as error:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "error": str(error), "message": "Capability discovery stopped safely."}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,227 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Detect and verify projects with deterministic language adapters."""
+
+import argparse
+from html.parser import HTMLParser
+import hashlib
+import json
+import os
+import pathlib
+import py_compile
+import shutil
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+ALLOWED_ROOTS = (ROOT, ROOT / "runtime" / "home" / "Documents")
+LANGUAGES = ("python", "node", "shell", "java", "kotlin", "android", "powershell", "static-web")
+SUFFIXES = {
+    "python": {".py"}, "node": {".js", ".cjs", ".mjs"}, "shell": {".sh"},
+    "java": {".java"}, "kotlin": {".kt", ".kts"}, "powershell": {".ps1", ".psm1"},
+    "static-web": {".html", ".htm", ".css", ".js"},
+}
+
+
+class ToolchainError(Exception):
+    pass
+
+
+def project_path(value):
+    path = pathlib.Path(value).expanduser().resolve(strict=True)
+    if not path.is_dir() or path.is_symlink():
+        raise ToolchainError("project_path_invalid")
+    if not any(path == root.resolve() or root.resolve() in path.parents for root in ALLOWED_ROOTS if root.exists()):
+        raise ToolchainError("project_outside_allowed_roots")
+    return path
+
+
+def files_for(path, suffixes):
+    values = []
+    for item in sorted(path.rglob("*")):
+        if any(part in {".git", "node_modules", "target", "build", "dist", ".gradle", "__pycache__"} for part in item.parts):
+            continue
+        if item.is_symlink():
+            if item.suffix.lower() in suffixes:
+                raise ToolchainError("project_source_symlink_refused")
+            continue
+        if item.is_file() and item.suffix.lower() in suffixes:
+            if item.stat().st_size > 2 * 1024 * 1024:
+                raise ToolchainError("source_file_too_large")
+            values.append(item)
+            if len(values) > 500:
+                raise ToolchainError("source_file_limit")
+    return values
+
+
+def detect(path):
+    markers = {
+        "android": ["AndroidManifest.xml", "settings.gradle", "settings.gradle.kts"],
+        "python": ["pyproject.toml", "requirements.txt", "setup.py"],
+        "node": ["package.json"],
+        "java": ["pom.xml", "build.gradle"],
+        "kotlin": ["build.gradle.kts"],
+        "powershell": [],
+        "static-web": ["index.html"],
+        "shell": [],
+    }
+    found = []
+    for language, names in markers.items():
+        if any((path / name).is_file() for name in names):
+            found.append(language)
+    for language in ("python", "node", "shell", "java", "kotlin", "powershell", "static-web"):
+        if language in found:
+            continue
+        if files_for(path, SUFFIXES[language]):
+            found.append(language)
+    if (path / "AndroidManifest.xml").is_file() or any(item.name == "AndroidManifest.xml" for item in path.rglob("AndroidManifest.xml")):
+        found.insert(0, "android")
+    return list(dict.fromkeys(found))
+
+
+def run_checked(command, cwd, timeout=180):
+    try:
+        completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+    except FileNotFoundError as error:
+        raise ToolchainError("tool_unavailable:" + command[0]) from error
+    if completed.returncode != 0:
+        raise ToolchainError("verification_failed:" + command[0])
+    return {"argv": command, "exitCode": 0, "output": (completed.stdout + completed.stderr)[-2000:]}
+
+
+def powershell_static_check(text):
+    quote = None
+    stack = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for character in text:
+        if quote:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+        elif character in "([{":
+            stack.append(character)
+        elif character in ")]}":
+            if not stack or stack.pop() != pairs[character]:
+                raise ToolchainError("powershell_structure_invalid")
+    if quote or stack:
+        raise ToolchainError("powershell_structure_invalid")
+
+
+def verify(path, language):
+    evidence = []
+    level = "syntax"
+    if language == "python":
+        sources = files_for(path, SUFFIXES[language])
+        for source in sources:
+            compile(source.read_text(encoding="utf-8"), str(source), "exec")
+    elif language == "node":
+        sources = files_for(path, SUFFIXES[language])
+        for source in sources:
+            evidence.append(run_checked(["node", "--check", str(source)], path))
+    elif language == "shell":
+        sources = files_for(path, SUFFIXES[language])
+        for source in sources:
+            evidence.append(run_checked(["bash", "-n", str(source)], path))
+    elif language == "java":
+        sources = files_for(path, SUFFIXES[language])
+        with tempfile.TemporaryDirectory() as output:
+            if sources:
+                evidence.append(run_checked(["javac", "-d", output, *map(str, sources)], path))
+        level = "compile"
+    elif language == "kotlin":
+        sources = files_for(path, SUFFIXES[language])
+        compiler = shutil.which("kotlinc")
+        if not compiler:
+            raise ToolchainError("tool_unavailable:kotlinc")
+        with tempfile.TemporaryDirectory() as output:
+            evidence.append(run_checked([compiler, *map(str, sources), "-d", str(pathlib.Path(output) / "out.jar")], path))
+        level = "compile"
+    elif language == "android":
+        manifests = [item for item in path.rglob("AndroidManifest.xml") if item.is_file() and not item.is_symlink()]
+        if not manifests:
+            raise ToolchainError("android_manifest_missing")
+        for manifest in manifests:
+            ET.parse(manifest)
+        for wrapper in (path / "gradlew",):
+            if wrapper.is_file():
+                evidence.append(run_checked(["bash", "-n", str(wrapper)], path))
+        level = "manifest-and-wrapper-static"
+        sources = manifests
+    elif language == "powershell":
+        sources = files_for(path, SUFFIXES[language])
+        for source in sources:
+            powershell_static_check(source.read_text(encoding="utf-8"))
+        level = "bounded-structural-static"
+    else:
+        sources = files_for(path, {".html", ".htm"})
+        if not sources:
+            raise ToolchainError("html_entry_missing")
+        for source in sources:
+            parser = HTMLParser()
+            parser.feed(source.read_text(encoding="utf-8"))
+            parser.close()
+    if not sources:
+        raise ToolchainError("source_files_missing")
+    records = []
+    for source in sources:
+        content = source.read_bytes()
+        records.append({
+            "path": source.relative_to(path).as_posix(), "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+    return {"language": language, "verificationLevel": level, "files": records, "commands": evidence}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Detect or verify a project using fixed language adapters.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("path")
+    verify_command = commands.add_parser("verify")
+    verify_command.add_argument("path")
+    verify_command.add_argument("--language", choices=LANGUAGES)
+    args = parser.parse_args()
+    try:
+        path = project_path(args.path)
+        detected = detect(path)
+        if args.command == "inspect":
+            tools = {
+                language: {
+                    "adapterAvailable": True,
+                    "nativeRuntimeAvailable": shutil.which({
+                        "python": "python", "node": "node", "shell": "bash", "java": "javac",
+                        "kotlin": "kotlinc", "android": "aapt", "powershell": "pwsh", "static-web": "python",
+                    }[language]) is not None
+                } for language in LANGUAGES
+            }
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "path": str(path), "detected": detected, "tools": tools,
+                "message": "Detected project languages and read back their local verification-tool readiness.",
+            }
+        else:
+            selected = args.language or (detected[0] if detected else None)
+            if not selected:
+                raise ToolchainError("project_language_unknown")
+            evidence = verify(path, selected)
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "path": str(path), "evidence": evidence,
+                "message": f"Verified the {selected} project with its deterministic {evidence['verificationLevel']} adapter.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (ToolchainError, OSError, ValueError, SyntaxError, UnicodeError, ET.ParseError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Project verification stopped without claiming unsupported toolchain success.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,134 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""High-level typed Android intents with resolution and execution receipts."""
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.parse
+
+from nemotron_android_policy import validate_package_id
+
+
+ANDROID = pathlib.Path(__file__).with_name("codex-android")
+MIME = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+*-]+$")
+
+
+class IntentError(Exception):
+    pass
+
+
+def uri(value, schemes):
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme.lower() not in schemes or not parsed.path and not parsed.netloc:
+        raise IntentError("uri_invalid")
+    if parsed.username or parsed.password or len(value) > 4096 or any(ord(ch) < 32 for ch in value):
+        raise IntentError("uri_invalid")
+    return value
+
+
+def build(args):
+    package = validate_package_id(args.package) if getattr(args, "package", None) else None
+    if args.workflow == "open-url":
+        spec = {"kind": "activity", "action": "android.intent.action.VIEW", "data": uri(args.url, {"http", "https"})}
+    elif args.workflow == "open-app":
+        spec = {
+            "kind": "activity", "action": "android.intent.action.MAIN",
+            "categories": ["android.intent.category.LAUNCHER"], "package": validate_package_id(args.target),
+        }
+    elif args.workflow == "settings":
+        target = validate_package_id(args.target)
+        spec = {
+            "kind": "activity", "action": "android.settings.APPLICATION_DETAILS_SETTINGS",
+            "data": "package:" + target, "package": "com.android.settings",
+        }
+    elif args.workflow == "share-text":
+        if not args.text or len(args.text) > 20_000 or any(ord(ch) < 9 for ch in args.text):
+            raise IntentError("share_text_invalid")
+        spec = {
+            "kind": "activity", "action": "android.intent.action.SEND", "type": "text/plain",
+            "extras": {"android.intent.extra.TEXT": args.text},
+        }
+    elif args.workflow == "view":
+        if not MIME.fullmatch(args.mime):
+            raise IntentError("mime_invalid")
+        spec = {
+            "kind": "activity", "action": "android.intent.action.VIEW",
+            "data": uri(args.uri, {"content", "http", "https"}), "type": args.mime,
+        }
+    else:
+        output = uri(args.output, {"content"})
+        spec = {
+            "kind": "activity", "action": "android.media.action.IMAGE_CAPTURE",
+            "extras": {"output": {"type": "uri", "value": output}},
+        }
+    if package:
+        spec["package"] = package
+    return spec
+
+
+def redacted(spec):
+    value = dict(spec)
+    if "extras" in value:
+        value["extras"] = {key: {"type": item.get("type")} if isinstance(item, dict) else {"type": type(item).__name__, "redacted": True}
+                           for key, item in value["extras"].items()}
+    return value
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Resolve or explicitly execute common typed Android intent workflows.")
+    workflows = parser.add_subparsers(dest="workflow", required=True)
+    open_url = workflows.add_parser("open-url")
+    open_url.add_argument("url")
+    open_app = workflows.add_parser("open-app")
+    open_app.add_argument("target")
+    settings = workflows.add_parser("settings")
+    settings.add_argument("target")
+    share = workflows.add_parser("share-text")
+    share.add_argument("text")
+    view = workflows.add_parser("view")
+    view.add_argument("uri")
+    view.add_argument("--mime", required=True)
+    capture = workflows.add_parser("capture-image")
+    capture.add_argument("--output", required=True)
+    for command in (open_url, open_app, settings, share, view, capture):
+        command.add_argument("--package")
+        command.add_argument("--execute", action="store_true")
+    args = parser.parse_args()
+    try:
+        spec = build(args)
+        mode = "intent" if args.execute else "resolve-intent"
+        completed = subprocess.run(
+            [str(ANDROID), mode, json.dumps(spec, separators=(",", ":"))],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        try:
+            inner = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            raise IntentError("intent_receipt_invalid") from error
+        if completed.returncode != 0 or inner.get("verified") is not True:
+            raise IntentError("intent_" + ("execution" if args.execute else "resolution") + "_failed")
+        output = {
+            "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+            "workflow": args.workflow, "executed": bool(args.execute), "spec": redacted(spec),
+            "resolutionOrExecution": inner,
+            "message": (
+                "Executed the typed Android intent and verified its postcondition."
+                if args.execute else
+                "Resolved the typed Android intent without opening an app or changing the visible UI."
+            ),
+        }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (IntentError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "The Android intent stopped without claiming an unverified resolution or action.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

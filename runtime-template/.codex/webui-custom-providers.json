@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "apiKey": "dummy",
+  "model": "nousresearch/hermes-4-405b",
+  "customKey": true,
+  "provider": "custom",
+  "customBaseUrl": "http://127.0.0.1:18774/v1",
+  "wireApi": "chat",
+  "providerKeys": {"custom": "dummy"}
+}
