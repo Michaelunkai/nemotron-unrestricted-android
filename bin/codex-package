@@ -1,0 +1,56 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Read-only Android package inspection with stable, signed evidence."""
+
+from __future__ import annotations
+
+import json
+import sys
+
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    package_evidence,
+    sanitized_policy_message,
+    validate_package_id,
+)
+
+
+def usage(stream=sys.stdout):
+    print("usage: codex-package inspect|verify <android.package.id>", file=stream)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help"}:
+        usage()
+        return 0
+    if len(args) != 2 or args[0] not in {"inspect", "verify"}:
+        usage(sys.stderr)
+        return 2
+    action, package = args
+    try:
+        package = validate_package_id(package)
+        evidence = package_evidence(package)
+        evidence["action"] = action
+        if action == "verify":
+            evidence["verified"] = bool(evidence.get("installed") and evidence.get("verified"))
+        print(json.dumps(evidence, separators=(",", ":"), sort_keys=True))
+        if not evidence.get("installed"):
+            return 4
+        return 0 if action == "inspect" or evidence.get("verified") else 5
+    except AndroidPolicyError as error:
+        print(sanitized_policy_message(error), file=sys.stderr)
+        return 77
+    except AndroidBridgeError as error:
+        print(
+            json.dumps(
+                {"ok": False, "error": error.code, "remoteStatus": error.remote_status, "verified": False},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,254 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Package-scoped uiautomator workflows with mandatory postconditions."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shlex
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+
+from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_rish, validate_package_id
+
+
+BOUNDS = re.compile(r"^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$")
+COMPONENT = re.compile(r"(?:topResumedActivity=.*?|mResumedActivity:.*?)\bu\d+\s+([^\s}]+/[^\s}]+)")
+ALLOWED_SELECTOR_FIELDS = {"text", "textContains", "resourceId", "contentDescription", "className", "clickable", "enabled"}
+
+
+class UiError(Exception):
+    pass
+
+
+def current_package():
+    result = run_rish("dumpsys activity activities")
+    match = COMPONENT.search(result.combined)
+    return match.group(1).split("/", 1)[0] if match else None
+
+
+def snapshot(package):
+    if current_package() != package:
+        raise UiError("foreground_package_mismatch")
+    remote = f"/data/local/tmp/nemotron-ui-{uuid.uuid4().hex}.xml"
+    command = (
+        f"uiautomator dump {shlex.quote(remote)} >/dev/null && "
+        f"cat {shlex.quote(remote)}; __ui_status=$?; rm -f {shlex.quote(remote)}; exit $__ui_status"
+    )
+    result = run_rish(command)
+    try:
+        root = ET.fromstring(result.stdout)
+    except ET.ParseError as error:
+        raise UiError("ui_snapshot_invalid") from error
+    return root, result.stdout
+
+
+def selector(value):
+    if not isinstance(value, dict) or not value or set(value) - ALLOWED_SELECTOR_FIELDS:
+        raise UiError("selector_invalid")
+    result = {}
+    for key, item in value.items():
+        if key in {"clickable", "enabled"}:
+            if not isinstance(item, bool):
+                raise UiError("selector_invalid")
+        elif not isinstance(item, str) or not item or len(item) > 512 or any(ord(char) < 32 for char in item):
+            raise UiError("selector_invalid")
+        result[key] = item
+    return result
+
+
+def matches(node, wanted):
+    mapping = {
+        "text": "text", "resourceId": "resource-id", "contentDescription": "content-desc",
+        "className": "class", "clickable": "clickable", "enabled": "enabled",
+    }
+    for key, value in wanted.items():
+        if key == "textContains":
+            if value not in node.attrib.get("text", ""):
+                return False
+        elif key in {"clickable", "enabled"}:
+            if node.attrib.get(mapping[key]) != ("true" if value else "false"):
+                return False
+        elif node.attrib.get(mapping[key]) != value:
+            return False
+    return True
+
+
+def find(root, wanted):
+    values = [node for node in root.iter("node") if matches(node, wanted)]
+    if not values:
+        raise UiError("selector_not_found")
+    if len(values) > 1:
+        raise UiError("selector_ambiguous")
+    return values[0]
+
+
+def center(node):
+    match = BOUNDS.fullmatch(node.attrib.get("bounds", ""))
+    if not match:
+        raise UiError("node_bounds_invalid")
+    x1, y1, x2, y2 = map(int, match.groups())
+    if x2 <= x1 or y2 <= y1:
+        raise UiError("node_bounds_invalid")
+    return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+def wait_for(package, wanted, attempts, delay=0.15):
+    last = None
+    for attempt in range(1, attempts + 1):
+        root, source = snapshot(package)
+        try:
+            return find(root, wanted), source, attempt
+        except UiError as error:
+            last = error
+            if str(error) != "selector_not_found" or attempt == attempts:
+                raise
+            time.sleep(delay)
+    raise last
+
+
+def validate_spec(value):
+    if not isinstance(value, list) or not 1 <= len(value) <= 50:
+        raise UiError("workflow_invalid")
+    allowed = {"action", "selector", "text", "after", "retries", "fallbackCoordinates", "direction", "durationMs"}
+    result = []
+    for step in value:
+        if not isinstance(step, dict) or set(step) - allowed:
+            raise UiError("step_schema_invalid")
+        action = step.get("action")
+        if action not in {"click", "set-text", "swipe", "back"}:
+            raise UiError("step_action_invalid")
+        retries = step.get("retries", 2)
+        if isinstance(retries, bool) or not isinstance(retries, int) or not 1 <= retries <= 5:
+            raise UiError("step_retries_invalid")
+        after = selector(step.get("after"))
+        before = selector(step["selector"]) if "selector" in step else None
+        fallback = step.get("fallbackCoordinates")
+        if fallback is not None and (
+            not isinstance(fallback, list) or len(fallback) != 2
+            or any(isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= 100000 for item in fallback)
+        ):
+            raise UiError("fallback_coordinates_invalid")
+        if action in {"click", "set-text"} and before is None and fallback is None:
+            raise UiError("action_target_missing")
+        if action == "set-text":
+            text = step.get("text")
+            if not isinstance(text, str) or len(text) > 4096 or any(ord(char) < 32 for char in text):
+                raise UiError("text_invalid")
+        if action == "swipe" and step.get("direction") not in {"up", "down", "left", "right"}:
+            raise UiError("swipe_direction_invalid")
+        result.append({**step, "after": after, "selector": before, "retries": retries})
+    return result
+
+
+def act(package, step):
+    root = None
+    target = None
+    if step["selector"]:
+        try:
+            target, _, _ = wait_for(package, step["selector"], step["retries"])
+        except UiError as error:
+            if str(error) != "selector_not_found" or step.get("fallbackCoordinates") is None:
+                raise
+    action = step["action"]
+    coordinates = None
+    if action in {"click", "set-text"}:
+        coordinates = center(target) if target is not None else tuple(step["fallbackCoordinates"])
+    if action == "click":
+        command = f"input tap {coordinates[0]} {coordinates[1]}"
+    elif action == "set-text":
+        command = f"input tap {coordinates[0]} {coordinates[1]} && input keyevent KEYCODE_MOVE_END && input text {shlex.quote(step['text'])}"
+    elif action == "back":
+        command = "input keyevent KEYCODE_BACK"
+    else:
+        display = run_rish("wm size").combined
+        match = re.search(r"Physical size: (\d+)x(\d+)", display) or re.search(r"Override size: (\d+)x(\d+)", display)
+        if not match:
+            raise UiError("display_size_unavailable")
+        width, height = map(int, match.groups())
+        points = {
+            "up": (width // 2, height * 3 // 4, width // 2, height // 4),
+            "down": (width // 2, height // 4, width // 2, height * 3 // 4),
+            "left": (width * 3 // 4, height // 2, width // 4, height // 2),
+            "right": (width // 4, height // 2, width * 3 // 4, height // 2),
+        }[step["direction"]]
+        duration = step.get("durationMs", 300)
+        if not isinstance(duration, int) or not 1 <= duration <= 5000:
+            raise UiError("swipe_duration_invalid")
+        command = "input swipe %d %d %d %d %d" % (*points, duration)
+    result = run_rish(command, require_success=False)
+    if result.remote_status != 0:
+        raise UiError("ui_action_failed")
+    _, _, attempts = wait_for(package, step["after"], step["retries"])
+    return attempts, coordinates if action in {"click", "set-text"} else None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Inspect or execute verified package-scoped Android UI workflows.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    inspect = commands.add_parser("snapshot")
+    inspect.add_argument("--package", required=True)
+    inspect.add_argument("--selector")
+    run = commands.add_parser("run")
+    run.add_argument("--package", required=True)
+    run.add_argument("--spec", required=True)
+    run.add_argument("--screenshot")
+    args = parser.parse_args()
+    try:
+        package = validate_package_id(args.package)
+        if args.command == "snapshot":
+            root, source = snapshot(package)
+            wanted = selector(json.loads(args.selector)) if args.selector else None
+            node = find(root, wanted) if wanted else None
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "package": package, "nodeCount": sum(1 for _ in root.iter("node")),
+                "selectorMatched": bool(node) if wanted else None,
+                "snapshotSha256": hashlib.sha256(source.encode()).hexdigest(),
+                "message": "Captured and hashed the package-scoped UI hierarchy without changing the screen.",
+            }
+        else:
+            steps = validate_spec(json.loads(pathlib.Path(args.spec).read_text(encoding="utf-8")))
+            events = []
+            for index, step in enumerate(steps, 1):
+                attempts, coordinates = act(package, step)
+                events.append({
+                    "step": index, "action": step["action"], "postconditionVerified": True,
+                    "attempts": attempts, "coordinateFallbackUsed": step["selector"] is None,
+                    "coordinates": coordinates,
+                    "message": f"Completed UI step {index} and verified its requested selector postcondition.",
+                })
+            screenshot = None
+            if args.screenshot:
+                path = pathlib.Path(args.screenshot).expanduser().resolve()
+                download = pathlib.Path("/storage/emulated/0/Download").resolve()
+                if path.parent != download or path.suffix.lower() != ".png":
+                    raise UiError("screenshot_path_invalid")
+                result = run_rish("screencap -p " + shlex.quote(str(path)), require_success=False)
+                if result.remote_status != 0 or not path.is_file():
+                    raise UiError("screenshot_failed")
+                screenshot = {
+                    "path": str(path), "bytes": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "package": package, "events": events, "screenshot": screenshot,
+                "message": "Completed every package-scoped UI action and verified every postcondition.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (UiError, AndroidPolicyError, AndroidBridgeError, OSError, ValueError, json.JSONDecodeError, ET.ParseError) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "UI automation stopped without claiming an unverified screen action.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

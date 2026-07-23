@@ -1,0 +1,2 @@
+#!/data/data/com.termux/files/home/nvidia-isolated-app/vendor/termux-api-client/runtime/bin/sh
+am startservice -n com.termux.api/.KeepAliveService

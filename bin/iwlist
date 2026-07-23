@@ -1,0 +1,24 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+PROJECT_BIN="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+interface=wlan0
+action=scan
+
+if [ "$#" -gt 0 ]; then
+  case "$1" in
+    -h|--help)
+      printf 'usage: iwlist [wlan0] scan\nAndroid compatibility wrapper with serialized passive scans and readable output.\n'
+      exit 0
+      ;;
+    scan|scanning) action=$1 ;;
+    *) interface=$1; action=${2:-scan} ;;
+  esac
+fi
+
+if [ "$interface" != "wlan0" ] || { [ "$action" != "scan" ] && [ "$action" != "scanning" ]; }; then
+  printf 'Android compatibility mode supports only: iwlist wlan0 scan\n' >&2
+  exit 2
+fi
+
+exec "$PROJECT_BIN/codex-wifi-scan" --refresh

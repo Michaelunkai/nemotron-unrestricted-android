@@ -1,0 +1,45 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Strict PowerShell-compatible entry point backed by the Windows gateway."""
+
+import json
+import os
+import subprocess
+import sys
+
+from nemotron_powershell_policy import (
+    PolicyViolation,
+    compatibility_payload,
+    sanitized_policy_message,
+)
+
+
+PROJECT_WIN = "/data/data/com.termux/files/home/nemotron-unrestricted-app/bin/codex-win"
+
+
+def usage():
+    print(
+        "usage: powershell -Command|-c|-lc '<PowerShell command>' | "
+        "powershell -l -c '<PowerShell command>' | "
+        "powershell --cleanup '<structured-json>'"
+    )
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in {"-h", "--help", "-Help"}:
+        usage()
+        return 0
+    if not args:
+        usage()
+        return 2
+    try:
+        request = compatibility_payload(args)
+    except PolicyViolation as error:
+        sys.stderr.write(sanitized_policy_message(error) + "\n")
+        return 64
+    payload = json.dumps(request, separators=(",", ":"))
+    return subprocess.call([PROJECT_WIN, payload], env=os.environ)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

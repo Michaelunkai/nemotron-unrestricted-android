@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy Static Site"
+  short_description: "Build, verify, and deploy a static site"
+  default_prompt: "Use $deploy-static-site to build, test, and deploy this static website with a verified release receipt."

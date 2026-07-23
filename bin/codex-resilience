@@ -1,0 +1,300 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Fail-safe mode, non-destructive sync, health, review, and local recovery."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+from nemotron_automation import AutomationState, DEFAULT_STATE, SAFE_MODE_FILE, atomic_write, safe_mode_status
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE = DEFAULT_STATE / "resilience"
+MANAGED_ROOTS = (ROOT / "workspace", ROOT / "runtime" / "home" / "Documents", ROOT / "build")
+
+
+class ResilienceError(ValueError):
+    pass
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def managed_directory(value: str, *, existing: bool) -> pathlib.Path:
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT / "workspace" / path
+    resolved = path.resolve(strict=existing)
+    if not any(resolved == root.resolve() or root.resolve() in resolved.parents for root in MANAGED_ROOTS):
+        raise ResilienceError("sync_path_outside_managed_roots")
+    if path.is_symlink() or (existing and not resolved.is_dir()):
+        raise ResilienceError("sync_directory_invalid")
+    return resolved
+
+
+def manifest(root: pathlib.Path) -> dict[str, dict]:
+    result = {}
+    if not root.exists():
+        return result
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ResilienceError("sync_symlink_refused")
+        if path.is_file():
+            name = path.relative_to(root).as_posix()
+            result[name] = {"bytes": path.stat().st_size, "sha256": sha256_file(path)}
+    return result
+
+
+def review_events() -> dict:
+    event_path = DEFAULT_STATE / "events.jsonl"
+    counts = {}
+    failures = {}
+    reviewed = 0
+    if event_path.is_file() and not event_path.is_symlink():
+        lines = event_path.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                counts["malformed"] = counts.get("malformed", 0) + 1
+                continue
+            reviewed += 1
+            event = str(item.get("event") or item.get("action") or "unknown")[:80]
+            counts[event] = counts.get(event, 0) + 1
+            error = str(item.get("error") or "")
+            if error:
+                safe_error = re.sub(r"[^a-zA-Z0-9_.:-]", "_", error)[:80]
+                failures[safe_error] = failures.get(safe_error, 0) + 1
+    suggestions = []
+    if counts.get("malformed"):
+        suggestions.append("Repair malformed JSONL producers before relying on event analytics.")
+    if failures:
+        top = max(failures, key=failures.get)
+        suggestions.append(f"Investigate the most frequent classified failure: {top} ({failures[top]} occurrence(s)).")
+    if not suggestions:
+        suggestions.append("No repeated classified failure was found in the bounded redacted event window.")
+    return {
+        "eventsReviewed": reviewed,
+        "eventCounts": counts,
+        "failureCounts": failures,
+        "suggestions": suggestions,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Manage local-only safe mode, checksum-aware sync, redacted review, health, and cache recovery."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    safe = commands.add_parser("safe-mode")
+    safe_sub = safe.add_subparsers(dest="safe_command", required=True)
+    safe_sub.add_parser("status")
+    enable = safe_sub.add_parser("enable")
+    enable.add_argument("--reason", required=True)
+    disable = safe_sub.add_parser("disable")
+    disable.add_argument("--state-sha256", required=True)
+    sync_plan = commands.add_parser("sync-plan")
+    sync_plan.add_argument("source")
+    sync_plan.add_argument("destination")
+    sync_plan.add_argument("--output", required=True)
+    sync_apply = commands.add_parser("sync-apply")
+    sync_apply.add_argument("--plan", required=True)
+    sync_apply.add_argument("--sha256", required=True)
+    commands.add_parser("review")
+    commands.add_parser("health")
+    commands.add_parser("recover-local-state")
+    args = parser.parse_args()
+    try:
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if args.command == "safe-mode":
+            if args.safe_command == "status":
+                mode = safe_mode_status(SAFE_MODE_FILE)
+                state_hash = sha256_file(SAFE_MODE_FILE) if SAFE_MODE_FILE.is_file() else None
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    **mode, "stateSha256": state_hash,
+                    "message": "Read the fail-safe network mode without changing runtime state.",
+                }
+            elif args.safe_command == "enable":
+                reason = args.reason.strip()
+                if not reason or len(reason) > 240 or any(ord(char) < 32 for char in reason):
+                    raise ResilienceError("safe_mode_reason_invalid")
+                state = {
+                    "schemaVersion": 1, "active": True, "reason": reason,
+                    "enabledEpoch": int(time.time()),
+                }
+                atomic_write(SAFE_MODE_FILE, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode())
+                output = {
+                    "schemaVersion": 1, "processCompleted": True,
+                    "taskVerified": safe_mode_status(SAFE_MODE_FILE)["active"],
+                    "stateSha256": sha256_file(SAFE_MODE_FILE), "mode": "local-only",
+                    "message": "Enabled local-only safe mode; network-heavy wrappers will now fail closed.",
+                }
+            else:
+                if not re.fullmatch(r"[0-9a-f]{64}", args.state_sha256.lower()):
+                    raise ResilienceError("safe_mode_state_hash_invalid")
+                if not SAFE_MODE_FILE.is_file() or sha256_file(SAFE_MODE_FILE) != args.state_sha256.lower():
+                    raise ResilienceError("safe_mode_state_changed")
+                previous = STATE / f"safe-mode-disabled-{int(time.time())}.json"
+                os.replace(SAFE_MODE_FILE, previous)
+                output = {
+                    "schemaVersion": 1, "processCompleted": True,
+                    "taskVerified": not safe_mode_status(SAFE_MODE_FILE)["active"],
+                    "mode": "normal", "previousState": str(previous),
+                    "message": "Disabled safe mode using the exact prior state hash and retained its record.",
+                }
+        elif args.command == "sync-plan":
+            source = managed_directory(args.source, existing=True)
+            destination = managed_directory(args.destination, existing=False)
+            source_manifest = manifest(source)
+            destination_manifest = manifest(destination)
+            copy = []
+            identical = []
+            conflicts = []
+            for name, item in source_manifest.items():
+                current = destination_manifest.get(name)
+                if current is None:
+                    copy.append({"path": name, **item})
+                elif current["sha256"] == item["sha256"]:
+                    identical.append(name)
+                else:
+                    conflicts.append({
+                        "path": name, "sourceSha256": item["sha256"],
+                        "destinationSha256": current["sha256"],
+                    })
+            plan = {
+                "schemaVersion": 1, "kind": "non-destructive-one-way-sync",
+                "createdEpoch": int(time.time()), "expiresEpoch": int(time.time()) + 3600,
+                "source": str(source), "destination": str(destination),
+                "sourceManifest": source_manifest, "destinationManifest": destination_manifest,
+                "copy": copy, "identical": identical, "conflicts": conflicts, "deletions": [],
+            }
+            plan_path = pathlib.Path(args.output).expanduser().resolve()
+            if ROOT / "build" not in plan_path.parents or plan_path.exists():
+                raise ResilienceError("sync_plan_path_invalid")
+            atomic_write(plan_path, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "plan": str(plan_path), "planSha256": sha256_file(plan_path),
+                "copyCount": len(copy), "identicalCount": len(identical),
+                "conflictCount": len(conflicts), "deletionCount": 0,
+                "message": "Created a one-hour checksum sync plan with explicit conflict copies and no deletions.",
+            }
+        elif args.command == "sync-apply":
+            plan_path = pathlib.Path(args.plan).expanduser().resolve(strict=True)
+            if ROOT / "build" not in plan_path.parents or plan_path.is_symlink():
+                raise ResilienceError("sync_plan_path_invalid")
+            if sha256_file(plan_path) != args.sha256.lower():
+                raise ResilienceError("sync_plan_hash_mismatch")
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            if plan.get("kind") != "non-destructive-one-way-sync" or plan.get("expiresEpoch", 0) < int(time.time()):
+                raise ResilienceError("sync_plan_expired")
+            source = managed_directory(plan["source"], existing=True)
+            destination = managed_directory(plan["destination"], existing=False)
+            if manifest(source) != plan["sourceManifest"] or manifest(destination) != plan["destinationManifest"]:
+                raise ResilienceError("sync_tree_changed")
+            staging = pathlib.Path(tempfile.mkdtemp(prefix=".sync-", dir=ROOT / "build"))
+            applied = []
+            try:
+                operations = [(item["path"], item["path"]) for item in plan["copy"]]
+                operations += [
+                    (item["path"], item["path"] + ".conflict-" + item["sourceSha256"][:12])
+                    for item in plan["conflicts"]
+                ]
+                for source_name, destination_name in operations:
+                    source_file = source.joinpath(*pathlib.PurePosixPath(source_name).parts)
+                    staged = staging.joinpath(*pathlib.PurePosixPath(destination_name).parts)
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source_file, staged)
+                    if sha256_file(staged) != plan["sourceManifest"][source_name]["sha256"]:
+                        raise ResilienceError("sync_copy_hash_mismatch")
+                destination.mkdir(parents=True, exist_ok=True)
+                for staged in sorted(path for path in staging.rglob("*") if path.is_file()):
+                    target = destination / staged.relative_to(staging)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists() or target.is_symlink():
+                        raise ResilienceError("sync_destination_collision")
+                    os.replace(staged, target)
+                    applied.append({
+                        "path": target.relative_to(destination).as_posix(),
+                        "sha256": sha256_file(target),
+                    })
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+            output = {
+                "schemaVersion": 1, "processCompleted": True,
+                "taskVerified": all(
+                    sha256_file(destination / item["path"]) == item["sha256"] for item in applied
+                ),
+                "applied": applied, "conflictCopies": len(plan["conflicts"]), "deletions": 0,
+                "message": "Applied the unchanged sync plan, preserved destination files, created explicit conflict copies, and verified every checksum.",
+            }
+        elif args.command == "review":
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                **review_events(),
+                "message": "Reviewed only a bounded redacted event projection and generated deterministic maintenance suggestions.",
+            }
+        elif args.command == "health":
+            mode = safe_mode_status(SAFE_MODE_FILE)
+            checks = []
+            for name, argv in (
+                ("doctor", [str(ROOT / "bin" / "codex-doctor"), "all", "--json"]),
+                ("care", [str(ROOT / "bin" / "codex-care"), "status"]),
+            ):
+                completed = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=90, check=False)
+                try:
+                    receipt = json.loads(completed.stdout)
+                except json.JSONDecodeError:
+                    receipt = {}
+                checks.append({
+                    "name": name, "exitCode": completed.returncode,
+                    "taskVerified": receipt.get("taskVerified") is True,
+                })
+            output = {
+                "schemaVersion": 1, "processCompleted": True,
+                "taskVerified": all(check["taskVerified"] for check in checks),
+                "safeMode": mode, "checks": checks,
+                "message": "Ran the read-only environment and recovery health checks and summarized verified results.",
+            }
+        else:
+            before = sorted(path.name for path in DEFAULT_STATE.glob("state.corrupt-*.db"))
+            state = AutomationState(DEFAULT_STATE)
+            with state.connect() as connection:
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            after = sorted(path.name for path in DEFAULT_STATE.glob("state.corrupt-*.db"))
+            output = {
+                "schemaVersion": 1, "processCompleted": True,
+                "taskVerified": integrity == "ok", "integrity": integrity,
+                "quarantinedCorruptDatabases": sorted(set(after) - set(before)),
+                "message": "Verified local automation state; a corrupt cache database would be quarantined and rebuilt without touching sessions or projects.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0 if output["taskVerified"] else 2
+    except (ResilienceError, OSError, ValueError, json.JSONDecodeError, sqlite3.Error, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error),
+            "message": "The resilience action stopped without claiming an unverified recovery or overwriting a conflict.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

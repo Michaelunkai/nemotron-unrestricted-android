@@ -1,0 +1,20 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  printf 'usage: codex-open-url <url>\n'
+  exit 0
+fi
+
+if [ "$#" -ne 1 ]; then
+  printf 'usage: codex-open-url <url>\n' >&2
+  exit 2
+fi
+
+case "$1" in
+  http://*|https://*|file://*|content://*|geo:*|market:*) ;;
+  *) printf 'unsupported URL scheme\n' >&2; exit 2 ;;
+esac
+
+printf -v quoted_url '%q' "$1"
+exec /data/data/com.termux/files/home/.local/bin/rish -c "am start -W -a android.intent.action.VIEW -d $quoted_url"

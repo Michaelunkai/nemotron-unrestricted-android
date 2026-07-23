@@ -1,0 +1,248 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Bounded DNS, route, Wi-Fi, TCP, HTTPS, LAN, and paired-PC diagnostics."""
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import pathlib
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from nemotron_android_policy import run_rish
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PC = os.environ.get("NEMOTRON_PC_COMMAND", str(ROOT / "bin" / "codex-pc"))
+WIFI = "/data/data/com.termux/files/usr/bin/termux-wifi-connectioninfo"
+HOST = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+class NetworkError(Exception):
+    pass
+
+
+def host(value):
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        if len(value) > 253 or ".." in value or not HOST.fullmatch(value):
+            raise NetworkError("host_invalid")
+        return value.lower()
+
+
+def timed(function):
+    started = time.monotonic()
+    value = function()
+    return value, round((time.monotonic() - started) * 1000, 2)
+
+
+def dns(value):
+    target = host(value)
+    try:
+        rows, latency = timed(lambda: socket.getaddrinfo(target, None, type=socket.SOCK_STREAM))
+        addresses = sorted({row[4][0] for row in rows})
+        category = None if addresses else "dns_no_records"
+    except socket.gaierror:
+        addresses, latency, category = [], 0, "dns_not_found"
+    return {
+        "check": "dns", "target": target, "addresses": addresses,
+        "reachable": bool(addresses), "latencyMs": latency, "failureCategory": category,
+    }
+
+
+def tcp(value, port, timeout):
+    target = host(value)
+    if not 1 <= port <= 65535:
+        raise NetworkError("port_invalid")
+    category = None
+    reachable = False
+    error_code = None
+    started = time.monotonic()
+    try:
+        with socket.create_connection((target, port), timeout=timeout):
+            reachable = True
+    except ConnectionRefusedError:
+        category = "connection_refused"
+    except socket.timeout:
+        category = "connection_timeout"
+    except socket.gaierror:
+        category = "dns_not_found"
+    except OSError as error:
+        category = "network_unreachable"
+        error_code = error.errno
+    return {
+        "check": "tcp", "target": target, "port": port, "reachable": reachable,
+        "latencyMs": round((time.monotonic() - started) * 1000, 2),
+        "failureCategory": category, "errorNumber": error_code,
+    }
+
+
+def https(value, timeout):
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise NetworkError("https_url_invalid")
+    request = urllib.request.Request(value, method="HEAD", headers={"User-Agent": "NemotronNetDiag/1.0"})
+    started = time.monotonic()
+    status = None
+    final_url = None
+    category = None
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl.create_default_context()) as response:
+            status, final_url = response.status, response.geturl()
+    except urllib.error.HTTPError as error:
+        status, final_url = error.code, error.geturl()
+        category = "http_status"
+    except ssl.SSLError:
+        category = "tls_verification"
+    except urllib.error.URLError as error:
+        category = "tls_verification" if isinstance(error.reason, ssl.SSLError) else "transport"
+    return {
+        "check": "https", "target": value, "status": status, "finalUrl": final_url,
+        "reachable": status is not None, "latencyMs": round((time.monotonic() - started) * 1000, 2),
+        "failureCategory": category,
+    }
+
+
+def route():
+    result = run_rish("ip -json route", require_success=False)
+    if result.remote_status != 0:
+        raise NetworkError("route_read_failed")
+    try:
+        rows = json.loads(result.stdout)
+        safe = []
+        for row in rows:
+            safe.append({
+                key: row.get(key) for key in ("dst", "dev", "gateway", "protocol", "scope")
+                if row.get(key) is not None
+            })
+    except json.JSONDecodeError:
+        safe = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            record = {"dst": fields[0]}
+            for token, key in (("dev", "dev"), ("via", "gateway"), ("proto", "protocol"), ("scope", "scope")):
+                if token in fields and fields.index(token) + 1 < len(fields):
+                    record[key] = fields[fields.index(token) + 1]
+            safe.append(record)
+        if not safe:
+            raise NetworkError("route_receipt_invalid")
+    default_present = any(item.get("dst") == "default" for item in safe)
+    return {
+        "check": "route", "routes": safe, "defaultRoutePresent": default_present,
+        "routeVisibility": "complete" if default_present else "android-restricted-partial",
+        "failureCategory": None,
+    }
+
+
+def wifi():
+    completed = subprocess.run([WIFI], capture_output=True, text=True, timeout=30, check=False)
+    if completed.returncode != 0:
+        raise NetworkError("wifi_read_failed")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise NetworkError("wifi_receipt_invalid") from error
+    ssid = value.get("ssid")
+    bssid = value.get("bssid")
+    ssid_known = isinstance(ssid, str) and ssid not in {"", "<unknown ssid>"}
+    bssid_known = isinstance(bssid, str) and bssid not in {"", "02:00:00:00:00:00"}
+    return {
+        "check": "wifi", "connected": bool(value.get("ip") and value.get("link_speed_mbps")),
+        "ssidSha256": hashlib.sha256(ssid.encode()).hexdigest() if ssid_known else None,
+        "bssidSha256": hashlib.sha256(bssid.encode()).hexdigest() if bssid_known else None,
+        "ip": value.get("ip"), "linkSpeedMbps": value.get("link_speed_mbps"),
+        "frequencyMhz": value.get("frequency_mhz"), "failureCategory": None,
+    }
+
+
+def pc():
+    completed = subprocess.run([PC, "diagnostics", "--fresh", "--timeout", "5"], cwd=ROOT, capture_output=True, text=True, timeout=25, check=False)
+    stream = completed.stdout if completed.returncode == 0 else completed.stderr
+    try:
+        value = json.loads(stream)
+    except json.JSONDecodeError as error:
+        raise NetworkError("pc_receipt_invalid") from error
+    if completed.returncode != 0:
+        return {"check": "pc", "reachable": False, "failureCategory": value.get("failureCategory", "transport"), "receipt": value}
+    process = value.get("process") or {}
+    listener = value.get("listener") or {}
+    return {
+        "check": "pc", "reachable": value.get("taskVerified") is True,
+        "failureCategory": value.get("failureCategory"),
+        "identity": {
+            "computer": process.get("computer"), "user": process.get("user"),
+            "tailnetAddress": listener.get("tailnetAddress"), "port": listener.get("port"),
+            "elevated": process.get("elevated"),
+        },
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run bounded read-only network diagnostics with actionable categories.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    dns_command = commands.add_parser("dns")
+    dns_command.add_argument("host")
+    tcp_command = commands.add_parser("tcp")
+    tcp_command.add_argument("host")
+    tcp_command.add_argument("port", type=int)
+    https_command = commands.add_parser("https")
+    https_command.add_argument("url")
+    commands.add_parser("route")
+    commands.add_parser("wifi")
+    commands.add_parser("pc")
+    all_command = commands.add_parser("all")
+    all_command.add_argument("--host", default="example.com")
+    all_command.add_argument("--port", type=int, default=443)
+    all_command.add_argument("--url", default="https://example.com/")
+    parser.add_argument("--timeout", type=int, default=5)
+    args = parser.parse_args()
+    try:
+        if not 1 <= args.timeout <= 30:
+            raise NetworkError("timeout_invalid")
+        if args.command == "dns":
+            checks = [dns(args.host)]
+        elif args.command == "tcp":
+            checks = [tcp(args.host, args.port, args.timeout)]
+        elif args.command == "https":
+            checks = [https(args.url, args.timeout)]
+        elif args.command == "route":
+            checks = [route()]
+        elif args.command == "wifi":
+            checks = [wifi()]
+        elif args.command == "pc":
+            checks = [pc()]
+        else:
+            checks = [dns(args.host), route(), wifi(), tcp(args.host, args.port, args.timeout), https(args.url, args.timeout), pc()]
+        failures = [item for item in checks if item.get("failureCategory")]
+        output = {
+            "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+            "checks": checks, "failureCategories": sorted({item["failureCategory"] for item in failures}),
+            "message": (
+                "Completed every requested read-only network diagnostic with explicit reachability and latency evidence."
+                if not failures else
+                "Completed the requested diagnostics and classified each observed network failure without changing network state."
+            ),
+        }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (NetworkError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Network diagnostics stopped without claiming unverified reachability.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

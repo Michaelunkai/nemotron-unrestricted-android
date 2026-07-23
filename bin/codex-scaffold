@@ -1,0 +1,186 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Create and verify reproducible projects from reviewed local templates."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT / "workspace"
+MANIFEST = ROOT / "templates" / "scaffold-manifest.json"
+STATE = ROOT / "runtime" / ".codex" / "automation" / "scaffolds"
+NAME = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
+
+
+class ScaffoldError(Exception):
+    pass
+
+
+def load_manifest():
+    value = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    if value.get("schemaVersion") != 1 or not isinstance(value.get("templates"), dict):
+        raise ScaffoldError("template_manifest_invalid")
+    return value
+
+
+def canonical_target(raw, name):
+    target = pathlib.Path(raw).expanduser().absolute() if raw else WORKSPACE / name
+    workspace = WORKSPACE.resolve()
+    target_parent = target.parent.resolve()
+    if workspace != target_parent and workspace not in target_parent.parents:
+        raise ScaffoldError("target_outside_workspace")
+    if target.exists() or target.is_symlink():
+        raise ScaffoldError("target_exists")
+    current = target.parent
+    while current != workspace:
+        if current.is_symlink():
+            raise ScaffoldError("target_symlink")
+        current = current.parent
+    return target
+
+
+def tree_hash(root):
+    digest = hashlib.sha256()
+    files = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file() and ".git" not in item.parts):
+        relative = path.relative_to(root).as_posix()
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        files.append({"path": relative, "sha256": content_hash, "bytes": path.stat().st_size})
+        digest.update(relative.encode() + b"\0" + content_hash.encode() + b"\n")
+    return digest.hexdigest(), files
+
+
+def verify_project(root, template):
+    command = template["verify"]
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=180, check=False)
+    except FileNotFoundError as error:
+        raise ScaffoldError("verification_tool_unavailable") from error
+    if result.returncode != 0:
+        raise ScaffoldError("generated_project_verification_failed")
+    return {"command": command, "exitCode": 0, "output": (result.stdout + result.stderr)[-2000:]}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="List, create, verify, or roll back local project scaffolds.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("list")
+    create = commands.add_parser("create")
+    create.add_argument("template")
+    create.add_argument("name")
+    create.add_argument("--output")
+    create.add_argument("--dry-run", action="store_true")
+    verify = commands.add_parser("verify")
+    verify.add_argument("receipt")
+    rollback = commands.add_parser("rollback")
+    rollback.add_argument("receipt")
+    args = parser.parse_args()
+    try:
+        manifest = load_manifest()
+        if args.command == "list":
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "templates": sorted(manifest["templates"]),
+                "manifestSha256": hashlib.sha256(MANIFEST.read_bytes()).hexdigest(),
+                "message": "Listed every reviewed local scaffold template.",
+            }
+        elif args.command == "create":
+            if args.template not in manifest["templates"]:
+                raise ScaffoldError("template_unknown")
+            if not NAME.fullmatch(args.name):
+                raise ScaffoldError("project_name_invalid")
+            target = canonical_target(args.output, args.name)
+            template = manifest["templates"][args.template]
+            planned = sorted(template["files"])
+            if args.dry_run:
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "dryRun": True, "template": args.template, "target": str(target), "files": planned,
+                    "message": "Validated the project name, destination, template, and planned files without writing.",
+                }
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                staging = pathlib.Path(tempfile.mkdtemp(prefix=".scaffold-", dir=target.parent))
+                try:
+                    for relative, content in template["files"].items():
+                        relative_path = pathlib.PurePosixPath(relative)
+                        if relative_path.is_absolute() or ".." in relative_path.parts:
+                            raise ScaffoldError("template_path_invalid")
+                        path = staging / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        rendered = content.replace("{{PROJECT_NAME}}", args.name).replace(
+                            "{{PROJECT_TITLE}}", args.name.replace("-", " ").title()
+                        )
+                        path.write_text(rendered, encoding="utf-8")
+                        if path.name.endswith(".sh"):
+                            path.chmod(0o755)
+                    verification = verify_project(staging, template)
+                    git = subprocess.run(["git", "init", "--quiet"], cwd=staging, capture_output=True, text=True, timeout=30, check=False)
+                    if git.returncode != 0:
+                        raise ScaffoldError("git_init_failed")
+                    tree, files = tree_hash(staging)
+                    os.replace(staging, target)
+                finally:
+                    if staging.exists():
+                        shutil.rmtree(staging)
+                receipt_id = uuid.uuid4().hex
+                record = {
+                    "schemaVersion": 1, "id": receipt_id, "template": args.template,
+                    "target": str(target), "treeSha256": tree, "files": files,
+                    "verification": verification,
+                }
+                STATE.mkdir(parents=True, exist_ok=True)
+                receipt_path = STATE / f"{receipt_id}.json"
+                receipt_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "project": record, "receipt": str(receipt_path),
+                    "message": "Created, tested, initialized, hashed, and recorded the project scaffold.",
+                }
+        else:
+            receipt_path = pathlib.Path(args.receipt).expanduser().resolve(strict=True)
+            if receipt_path.parent != STATE.resolve() or receipt_path.suffix != ".json":
+                raise ScaffoldError("receipt_outside_state")
+            record = json.loads(receipt_path.read_text(encoding="utf-8"))
+            target = pathlib.Path(record["target"])
+            tree, files = tree_hash(target)
+            if tree != record["treeSha256"] or files != record["files"]:
+                raise ScaffoldError("project_changed_since_scaffold")
+            if args.command == "verify":
+                verification = verify_project(target, manifest["templates"][record["template"]])
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "treeSha256": tree, "verification": verification,
+                    "message": "Verified the scaffold file manifest and its template test command.",
+                }
+            else:
+                shutil.rmtree(target)
+                if target.exists():
+                    raise ScaffoldError("rollback_failed")
+                record["rolledBack"] = True
+                receipt_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "target": str(target), "message": "Removed only the unchanged scaffold recorded by this receipt.",
+                }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (ScaffoldError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Scaffolding stopped without overwriting or removing unverified project data.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

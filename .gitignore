@@ -1,0 +1,22 @@
+# Private runtime and user data
+/runtime/
+/workspace/
+/MASTER_HANDOFF_PROMPT.md
+
+# Private signing material and build scratch
+/build/*
+!/build/signing.properties.example
+/dist/*.apk
+/dist/*.apk.idsig
+/dist/*.sha256
+
+# Local caches and generated state
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+*.log
+*.sqlite*
+*.env
+!.env.example
+!runtime-template/.codex/openrouter.env.example

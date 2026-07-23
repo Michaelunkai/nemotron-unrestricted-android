@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backup Photos to PC"
+  short_description: "Verify and back up Android photos to PC"
+  default_prompt: "Use $backup-photos-to-pc to copy selected Android photos to my paired PC with checksums and source preservation."

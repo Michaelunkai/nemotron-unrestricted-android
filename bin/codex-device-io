@@ -1,0 +1,268 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Typed Android clipboard, notification, speech, media, and volume actions."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TERMUX = pathlib.Path("/data/data/com.termux/files/usr/bin")
+COMMANDS = {
+    "clipboard-get": TERMUX / "termux-clipboard-get",
+    "clipboard-set": TERMUX / "termux-clipboard-set",
+    "notification": TERMUX / "termux-notification",
+    "toast": TERMUX / "termux-toast",
+    "tts": TERMUX / "termux-tts-speak",
+    "media": TERMUX / "termux-media-player",
+    "volume": TERMUX / "termux-volume",
+}
+STREAMS = {"alarm", "music", "notification", "ring", "system", "call"}
+SAFE_TEXT = re.compile(r"^[^\x00-\x08\x0b\x0c\x0e-\x1f]{1,240}$")
+
+
+class DeviceIOError(ValueError):
+    pass
+
+
+def invoke(name: str, args: list[str], *, stdin: str | None = None, timeout: int = 30) -> subprocess.CompletedProcess:
+    command = COMMANDS[name]
+    if not command.is_file():
+        raise DeviceIOError(name + "_unavailable")
+    try:
+        return subprocess.run(
+            [str(command), *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise DeviceIOError(name + "_timeout") from error
+
+
+def read_stdin(maximum: int = 32_768) -> str:
+    value = sys.stdin.read(maximum + 1)
+    if not value or len(value) > maximum or "\0" in value:
+        raise DeviceIOError("stdin_text_invalid")
+    return value
+
+
+def checked(process: subprocess.CompletedProcess, action: str) -> None:
+    if process.returncode != 0:
+        raise DeviceIOError(action + "_failed")
+
+
+def text_metadata(value: str) -> dict:
+    return {
+        "characterCount": len(value),
+        "sha256": hashlib.sha256(value.encode()).hexdigest(),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Use typed Android clipboard, notification, TTS, media, and volume routes."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    get_clipboard = commands.add_parser("clipboard-get")
+    get_clipboard.add_argument("--reveal", action="store_true")
+    commands.add_parser("clipboard-set")
+    notify = commands.add_parser("notify")
+    notify.add_argument("--title", required=True)
+    notify.add_argument("--id", default="nemotron-automation")
+    notify.add_argument("--priority", choices=("min", "low", "default", "high", "max"), default="default")
+    toast = commands.add_parser("toast")
+    toast.add_argument("--short", action="store_true")
+    tts = commands.add_parser("tts")
+    tts.add_argument("--language")
+    tts.add_argument("--rate", type=float, default=1.0)
+    tts.add_argument("--pitch", type=float, default=1.0)
+    media = commands.add_parser("media")
+    media.add_argument("action", choices=("info", "play", "pause", "stop"))
+    media.add_argument("--file")
+    volume = commands.add_parser("volume")
+    volume.add_argument("action", choices=("list", "set"))
+    volume.add_argument("--stream", choices=sorted(STREAMS))
+    volume.add_argument("--level", type=int)
+    args = parser.parse_args()
+    try:
+        if args.command == "status":
+            availability = {name: path.is_file() for name, path in COMMANDS.items()}
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "available": availability,
+                "message": "Checked the installed typed Android I/O routes without changing device state.",
+            }
+        elif args.command == "clipboard-get":
+            process = invoke("clipboard-get", [])
+            checked(process, "clipboard_read")
+            metadata = text_metadata(process.stdout)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                **metadata,
+                "privacy": "revealed-by-explicit-request" if args.reveal else "content-redacted",
+                "message": "Read the current Android clipboard without persisting it.",
+            }
+            if args.reveal:
+                output["text"] = process.stdout
+        elif args.command == "clipboard-set":
+            value = read_stdin()
+            process = invoke("clipboard-set", [], stdin=value)
+            checked(process, "clipboard_write")
+            readback = invoke("clipboard-get", [])
+            checked(readback, "clipboard_readback")
+            verified = readback.stdout == value
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": verified,
+                **text_metadata(value),
+                "privacy": "content-redacted",
+                "message": "Wrote the Android clipboard from stdin and verified an exact readback." if verified else "Clipboard readback did not match; no success was claimed.",
+            }
+        elif args.command == "notify":
+            if not SAFE_TEXT.fullmatch(args.title) or not SAFE_TEXT.fullmatch(args.id):
+                raise DeviceIOError("notification_metadata_invalid")
+            content = read_stdin(4096)
+            process = invoke(
+                "notification",
+                ["--title", args.title, "--id", args.id, "--priority", args.priority],
+                stdin=content,
+            )
+            checked(process, "notification")
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "notificationId": args.id,
+                **text_metadata(content),
+                "privacy": "content-redacted",
+                "message": "Sent the Android notification through the typed Termux API route.",
+            }
+        elif args.command == "toast":
+            content = read_stdin(1000)
+            process = invoke("toast", ["-s"] if args.short else [], stdin=content)
+            checked(process, "toast")
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                **text_metadata(content),
+                "privacy": "content-redacted",
+                "message": "Displayed the transient Android message through the typed Termux API route.",
+            }
+        elif args.command == "tts":
+            content = read_stdin(16_384)
+            if not 0.1 <= args.rate <= 4.0 or not 0.1 <= args.pitch <= 2.0:
+                raise DeviceIOError("tts_range_invalid")
+            tts_args = ["-r", str(args.rate), "-p", str(args.pitch)]
+            if args.language:
+                if not re.fullmatch(r"[A-Za-z]{2,3}(?:[-_][A-Za-z]{2})?", args.language):
+                    raise DeviceIOError("tts_language_invalid")
+                tts_args += ["-l", args.language.replace("_", "-")]
+            process = invoke("tts", tts_args, stdin=content, timeout=120)
+            checked(process, "tts")
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                **text_metadata(content),
+                "privacy": "content-redacted",
+                "message": "Submitted the text to Android text-to-speech without exposing it in command arguments.",
+            }
+        elif args.command == "media":
+            media_args = [args.action]
+            if args.action == "play" and args.file:
+                path = pathlib.Path(args.file).expanduser().resolve(strict=True)
+                if path.is_symlink() or not path.is_file():
+                    raise DeviceIOError("media_file_invalid")
+                media_args.append(str(path))
+            elif args.file:
+                raise DeviceIOError("media_file_not_applicable")
+            process = invoke("media", media_args)
+            checked(process, "media")
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "action": args.action,
+                "state": process.stdout.strip() if args.action == "info" else None,
+                "message": "Read Android media playback state." if args.action == "info" else f"Sent the Android media {args.action} action.",
+            }
+        else:
+            if args.action == "list":
+                process = invoke("volume", [])
+                checked(process, "volume_list")
+                try:
+                    levels = json.loads(process.stdout)
+                except json.JSONDecodeError as error:
+                    raise DeviceIOError("volume_receipt_invalid") from error
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": isinstance(levels, list),
+                    "streams": levels,
+                    "message": "Read the current Android audio stream levels.",
+                }
+            else:
+                if args.stream is None or args.level is None or not 0 <= args.level <= 100:
+                    raise DeviceIOError("volume_set_arguments_required")
+                before = invoke("volume", [])
+                checked(before, "volume_read")
+                levels = json.loads(before.stdout)
+                selected = next((item for item in levels if item.get("stream") == args.stream), None)
+                if not selected or not isinstance(selected.get("max_volume"), int):
+                    raise DeviceIOError("volume_stream_unavailable")
+                absolute = round(selected["max_volume"] * args.level / 100)
+                process = invoke("volume", [args.stream, str(absolute)])
+                checked(process, "volume_set")
+                after = invoke("volume", [])
+                checked(after, "volume_readback")
+                after_levels = json.loads(after.stdout)
+                current = next((item for item in after_levels if item.get("stream") == args.stream), None)
+                verified = bool(current and current.get("volume") == absolute)
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": verified,
+                    "stream": args.stream,
+                    "requestedPercent": args.level,
+                    "absoluteLevel": absolute,
+                    "previousAbsoluteLevel": selected.get("volume"),
+                    "message": "Set the Android audio stream and verified the exact readback." if verified else "Audio readback did not match; no success was claimed.",
+                }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0 if output["taskVerified"] else 2
+    except (DeviceIOError, OSError, ValueError, json.JSONDecodeError) as error:
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "processCompleted": False,
+                    "taskVerified": False,
+                    "error": str(error),
+                    "message": "The Android I/O action stopped without claiming an unverified effect.",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

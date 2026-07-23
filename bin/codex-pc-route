@@ -1,0 +1,189 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Select an authenticated paired-PC route using identity and latency evidence."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+
+from nemotron_automation import AutomationState, DEFAULT_STATE
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+CONFIG = ROOT / "runtime" / ".codex" / "pc-routes.json"
+PC = os.environ.get("NEMOTRON_PC_COMMAND", str(ROOT / "bin" / "codex-pc"))
+SSH = os.environ.get("NEMOTRON_SSH_COMMAND", shutil.which("ssh") or "")
+CURL = os.environ.get("NEMOTRON_CURL_COMMAND", shutil.which("curl") or "")
+SMB = os.environ.get("NEMOTRON_SMB_COMMAND", shutil.which("smbclient") or "")
+HYSTERESIS = 0.20
+
+
+class RouteError(Exception):
+    pass
+
+
+def timed(argv, timeout=12):
+    started = time.monotonic()
+    try:
+        result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=timeout, check=False)
+        return result, round((time.monotonic() - started) * 1000, 1)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return subprocess.CompletedProcess(argv, 124, "", str(error)), round((time.monotonic() - started) * 1000, 1)
+
+
+def config():
+    if not CONFIG.exists():
+        return {"schemaVersion": 1, "ssh": None, "https": None, "smb": None}
+    if CONFIG.is_symlink() or CONFIG.stat().st_mode & 0o077:
+        raise RouteError("route_config_permissions")
+    try:
+        value = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RouteError("route_config_invalid") from error
+    if value.get("schemaVersion") != 1 or set(value) - {"schemaVersion", "ssh", "https", "smb"}:
+        raise RouteError("route_config_schema")
+    return value
+
+
+def gateway():
+    result, latency = timed([PC, "status", "--fresh", "--timeout", "5"], 25)
+    try:
+        receipt = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        receipt = {}
+    eligible = result.returncode == 0 and receipt.get("verified") is True and receipt.get("taskVerified") is True
+    return {
+        "route": "gateway", "configured": True, "available": result.returncode == 0,
+        "identityVerified": eligible, "authenticated": eligible, "eligible": eligible,
+        "latencyMs": latency, "endpoint": receipt.get("tailnetAddress"),
+        "identity": receipt.get("computer"), "reason": None if eligible else "verified_gateway_unavailable",
+    }
+
+
+def ssh_route(spec):
+    if not spec:
+        return {"route": "ssh", "configured": False, "eligible": False, "reason": "not_configured"}
+    required = {"host", "user", "port", "knownHosts"}
+    if set(spec) != required or not isinstance(spec["port"], int) or not 1 <= spec["port"] <= 65535:
+        return {"route": "ssh", "configured": True, "eligible": False, "reason": "config_invalid"}
+    known = pathlib.Path(spec["knownHosts"]).resolve()
+    if not SSH or not known.is_file() or known.is_symlink() or known.stat().st_mode & 0o077:
+        return {"route": "ssh", "configured": True, "eligible": False, "reason": "strict_identity_material_unavailable"}
+    argv = [
+        SSH, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={known}", "-o", "ConnectTimeout=5",
+        "-p", str(spec["port"]), f"{spec['user']}@{spec['host']}", "printf", "NEMOTRON_SSH_READY",
+    ]
+    result, latency = timed(argv, 12)
+    eligible = result.returncode == 0 and result.stdout == "NEMOTRON_SSH_READY"
+    return {
+        "route": "ssh", "configured": True, "available": result.returncode == 0,
+        "identityVerified": eligible, "authenticated": eligible, "eligible": eligible,
+        "latencyMs": latency, "endpoint": f"{spec['host']}:{spec['port']}",
+        "identity": spec["user"], "reason": None if eligible else "strict_ssh_probe_failed",
+    }
+
+
+def https_route(spec):
+    if not spec:
+        return {"route": "https", "configured": False, "eligible": False, "reason": "not_configured"}
+    if set(spec) != {"url", "pinnedPublicKey"}:
+        return {"route": "https", "configured": True, "eligible": False, "reason": "config_invalid"}
+    parsed = urllib.parse.urlparse(spec["url"])
+    pin = spec["pinnedPublicKey"]
+    if parsed.scheme != "https" or not parsed.hostname or not isinstance(pin, str) or not pin.startswith("sha256//"):
+        return {"route": "https", "configured": True, "eligible": False, "reason": "tls_pin_required"}
+    if not CURL:
+        return {"route": "https", "configured": True, "eligible": False, "reason": "curl_missing"}
+    result, latency = timed([
+        CURL, "--silent", "--show-error", "--fail", "--max-time", "8",
+        "--pinnedpubkey", pin, "--output", "/dev/null", "--write-out", "%{http_code}",
+        spec["url"],
+    ], 12)
+    eligible = result.returncode == 0 and result.stdout.strip().isdigit() and int(result.stdout.strip()) < 500
+    return {
+        "route": "https", "configured": True, "available": result.returncode == 0,
+        "identityVerified": eligible, "authenticated": eligible, "eligible": eligible,
+        "latencyMs": latency, "endpoint": f"{parsed.hostname}:{parsed.port or 443}",
+        "identity": parsed.hostname, "reason": None if eligible else "pinned_https_probe_failed",
+    }
+
+
+def smb_route(spec):
+    if not spec:
+        return {"route": "smb", "configured": False, "eligible": False, "reason": "not_configured"}
+    if set(spec) != {"server", "share", "credentialsFile", "requireSigning"} or spec["requireSigning"] is not True:
+        return {"route": "smb", "configured": True, "eligible": False, "reason": "signing_required"}
+    credentials = pathlib.Path(spec["credentialsFile"]).resolve()
+    if not SMB or not credentials.is_file() or credentials.is_symlink() or credentials.stat().st_mode & 0o077:
+        return {"route": "smb", "configured": True, "eligible": False, "reason": "authenticated_smb_unavailable"}
+    result, latency = timed([
+        SMB, f"//{spec['server']}/{spec['share']}", "-A", str(credentials),
+        "--client-protection=sign", "-c", "quit",
+    ], 15)
+    eligible = result.returncode == 0
+    return {
+        "route": "smb", "configured": True, "available": result.returncode == 0,
+        "identityVerified": eligible, "authenticated": eligible, "eligible": eligible,
+        "latencyMs": latency, "endpoint": spec["server"], "identity": spec["share"],
+        "reason": None if eligible else "signed_smb_probe_failed",
+    }
+
+
+def select(routes, state):
+    eligible = [route for route in routes if route.get("eligible")]
+    if not eligible:
+        return None
+    fastest = min(eligible, key=lambda route: route["latencyMs"])
+    prior = state.cache_get("pc_routes", "selected")
+    if prior:
+        current = next((route for route in eligible if route["route"] == prior["value"].get("route")), None)
+        if current and current["latencyMs"] <= fastest["latencyMs"] * (1 + HYSTERESIS):
+            return current
+    return fastest
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-pc-route",
+        description="Inspect authenticated PC routes and select the best identity-verified path.",
+    )
+    parser.add_argument("command", choices=("status", "select"))
+    args = parser.parse_args()
+    try:
+        settings = config()
+        routes = [
+            gateway(), ssh_route(settings.get("ssh")),
+            https_route(settings.get("https")), smb_route(settings.get("smb")),
+        ]
+        state = AutomationState()
+        selected = select(routes, state)
+        if selected:
+            state.cache_set("pc_routes", "selected", {
+                "route": selected["route"], "endpoint": selected.get("endpoint"),
+                "identity": selected.get("identity"),
+            }, 300)
+        verified = selected is not None
+        print(json.dumps({
+            "schemaVersion": 1,
+            "action": "Select an authenticated paired-PC route" if args.command == "select" else "Inspect authenticated paired-PC routes",
+            "processCompleted": True, "taskVerified": verified,
+            "selected": selected, "routes": routes,
+            "hysteresisPercent": int(HYSTERESIS * 100),
+            "message": "Selected the best authenticated identity-verified PC route." if verified else "No configured PC route passed authentication and identity verification.",
+        }, sort_keys=True))
+        return 0 if verified else 3
+    except (OSError, RouteError, ValueError) as error:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "error": str(error), "message": "PC route selection stopped safely."}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

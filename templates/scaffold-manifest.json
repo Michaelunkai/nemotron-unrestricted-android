@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "templates": {
+    "python-app": {
+      "files": {
+        ".gitignore": "__pycache__/\n*.pyc\n.venv/\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nRun `python main.py` and verify with `python -m unittest`.\n",
+        "main.py": "def main():\n    print(\"{{PROJECT_NAME}} ready\")\n\n\nif __name__ == \"__main__\":\n    main()\n",
+        "test_main.py": "import io\nimport unittest\nfrom contextlib import redirect_stdout\nimport main\n\n\nclass MainTests(unittest.TestCase):\n    def test_main(self):\n        output = io.StringIO()\n        with redirect_stdout(output):\n            main.main()\n        self.assertIn(\"ready\", output.getvalue())\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "verify": ["python", "-m", "unittest", "-v"]
+    },
+    "node-app": {
+      "files": {
+        ".gitignore": "node_modules/\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nRun `npm test`.\n",
+        "index.js": "'use strict';\nfunction message() { return '{{PROJECT_NAME}} ready'; }\nif (require.main === module) console.log(message());\nmodule.exports = { message };\n",
+        "package.json": "{\"name\":\"{{PROJECT_NAME}}\",\"version\":\"0.1.0\",\"private\":true,\"scripts\":{\"test\":\"node --test\"}}\n",
+        "test.js": "'use strict';\nconst test = require('node:test');\nconst assert = require('node:assert/strict');\nconst { message } = require('./index');\ntest('message', () => assert.match(message(), /ready/));\n"
+      },
+      "verify": ["npm", "test", "--silent"]
+    },
+    "shell-tool": {
+      "files": {
+        ".gitignore": "*.tmp\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nRun `bash tool.sh`.\n",
+        "tool.sh": "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' '{{PROJECT_NAME}} ready'\n"
+      },
+      "verify": ["bash", "-n", "tool.sh"]
+    },
+    "html-static": {
+      "files": {
+        "README.md": "# {{PROJECT_TITLE}}\n\nOpen `index.html` or serve this directory with a local static server.\n",
+        "index.html": "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{PROJECT_TITLE}}</title><link rel=\"stylesheet\" href=\"style.css\"></head><body><main><h1>{{PROJECT_TITLE}}</h1><p>Ready.</p></main><script src=\"app.js\"></script></body></html>\n",
+        "style.css": ":root{font-family:system-ui;color-scheme:light dark}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:42rem;padding:2rem}\n",
+        "app.js": "'use strict';\ndocument.documentElement.dataset.app = '{{PROJECT_NAME}}';\n"
+      },
+      "verify": ["python", "-c", "from pathlib import Path; s=Path('index.html').read_text(); assert '<!doctype html>' in s.lower() and '<title>' in s"]
+    },
+    "go-web": {
+      "files": {
+        ".gitignore": "{{PROJECT_NAME}}\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nRun `go test ./...`.\n",
+        "go.mod": "module example.com/{{PROJECT_NAME}}\n\ngo 1.22\n",
+        "main.go": "package main\n\nimport (\n \"fmt\"\n \"net/http\"\n)\n\nfunc handler(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, \"{{PROJECT_NAME}} ready\") }\nfunc main() { http.HandleFunc(\"/\", handler); _ = http.ListenAndServe(\"127.0.0.1:8080\", nil) }\n",
+        "main_test.go": "package main\n\nimport (\n \"net/http/httptest\"\n \"strings\"\n \"testing\"\n)\nfunc TestHandler(t *testing.T) { w := httptest.NewRecorder(); handler(w, httptest.NewRequest(\"GET\", \"/\", nil)); if !strings.Contains(w.Body.String(), \"ready\") { t.Fatal(w.Body.String()) } }\n"
+      },
+      "verify": ["go", "test", "./..."]
+    },
+    "rust-cli": {
+      "files": {
+        ".gitignore": "target/\n",
+        "Cargo.toml": "[package]\nname = \"{{PROJECT_NAME}}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nRun `cargo test`.\n",
+        "src/main.rs": "fn message() -> &'static str { \"{{PROJECT_NAME}} ready\" }\nfn main() { println!(\"{}\", message()); }\n#[cfg(test)] mod tests { use super::*; #[test] fn ready() { assert!(message().contains(\"ready\")); } }\n"
+      },
+      "verify": ["cargo", "test", "--quiet"]
+    },
+    "java-app": {
+      "files": {
+        ".gitignore": "*.class\nout/\n",
+        "Main.java": "public final class Main { public static void main(String[] args) { System.out.println(\"{{PROJECT_NAME}} ready\"); } }\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nCompile with `javac Main.java` and run with `java Main`.\n"
+      },
+      "verify": ["javac", "Main.java"]
+    },
+    "powershell-tool": {
+      "files": {
+        "README.md": "# {{PROJECT_TITLE}}\n\nRun `pwsh -NoProfile -File tool.ps1` on the paired PC.\n",
+        "tool.ps1": "[CmdletBinding()]\nparam()\nSet-StrictMode -Version Latest\n$ErrorActionPreference = 'Stop'\nWrite-Output '{{PROJECT_NAME}} ready'\n"
+      },
+      "verify": ["python", "-c", "from pathlib import Path; s=Path('tool.ps1').read_text(); assert 'Set-StrictMode' in s and \"ErrorActionPreference\" in s"]
+    }
+  }
+}

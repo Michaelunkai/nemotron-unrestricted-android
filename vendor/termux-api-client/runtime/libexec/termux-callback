@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/home/nvidia-isolated-app/vendor/termux-api-client/runtime/bin/bash
+set -e -u
+$TERMUX_CALLBACK "$@"

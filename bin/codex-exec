@@ -1,0 +1,391 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Execute an explicit argv request without an implicit shell.
+
+Complex shell work must be stored in a script and passed with ``--script`` or
+through a JSON request file.  Scripts are syntax checked before execution.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+
+
+APP_ROOT = pathlib.Path(__file__).resolve().parent.parent
+BASH = "/data/data/com.termux/files/usr/bin/bash"
+MAX_REQUEST_BYTES = 64 * 1024
+MAX_ARGUMENTS = 256
+MAX_ARGUMENT_CHARS = 16_384
+MAX_OUTPUT_CHARS = 256_000
+MAX_TIMEOUT_SECONDS = 900
+WAKE_LOCK = os.environ.get("NEMOTRON_WAKE_LOCK_COMMAND", "/data/data/com.termux/files/usr/bin/termux-wake-lock")
+WAKE_UNLOCK = os.environ.get("NEMOTRON_WAKE_UNLOCK_COMMAND", "/data/data/com.termux/files/usr/bin/termux-wake-unlock")
+
+
+class RequestError(ValueError):
+    pass
+
+
+def emit(payload: dict) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
+
+
+def clean_text(value: object, field: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise RequestError(field + "_type")
+    text = value.strip()
+    if not text or len(text) > maximum or any(ord(character) < 32 for character in text):
+        raise RequestError(field + "_shape")
+    return text
+
+
+def clean_args(value: object) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > MAX_ARGUMENTS:
+        raise RequestError("argv_shape")
+    result = []
+    for argument in value:
+        if not isinstance(argument, str) or len(argument) > MAX_ARGUMENT_CHARS or "\0" in argument:
+            raise RequestError("argv_argument")
+        result.append(argument)
+    return result
+
+
+def clean_timeout(value: object) -> int:
+    if isinstance(value, bool):
+        raise RequestError("timeout_type")
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError) as error:
+        raise RequestError("timeout_type") from error
+    if not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
+        raise RequestError("timeout_range")
+    return timeout
+
+
+def request_path(value: str) -> pathlib.Path:
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        path = APP_ROOT / path
+    path = path.resolve()
+    if not path.is_file() or path.is_symlink():
+        raise RequestError("request_file")
+    if path.stat().st_size > MAX_REQUEST_BYTES:
+        raise RequestError("request_size")
+    return path
+
+
+def script_path(value: object) -> pathlib.Path:
+    text = clean_text(value, "script", 4096)
+    path = pathlib.Path(text)
+    if not path.is_absolute():
+        path = APP_ROOT / path
+    path = path.resolve()
+    if not path.is_file() or path.is_symlink():
+        raise RequestError("script_file")
+    return path
+
+
+def load_request(path_value: str) -> dict:
+    try:
+        payload = json.loads(request_path(path_value).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RequestError("request_json") from error
+    if not isinstance(payload, dict):
+        raise RequestError("request_object")
+    allowed = {
+        "schemaVersion", "purpose", "program", "args", "script", "cwd",
+        "timeoutSeconds", "retries", "retrySafe", "verify", "wakeLock",
+    }
+    if set(payload) - allowed:
+        raise RequestError("request_fields")
+    if payload.get("schemaVersion") != 1:
+        raise RequestError("schema_version")
+    return payload
+
+
+def build_request(arguments: list[str]) -> dict:
+    if arguments[:1] == ["--request"] and len(arguments) == 2:
+        return load_request(arguments[1])
+    if arguments[:1] == ["--script"] and len(arguments) == 2:
+        return {
+            "schemaVersion": 1,
+            "purpose": "Run the prepared task script after validating its shell syntax",
+            "script": arguments[1],
+            "timeoutSeconds": 120,
+        }
+    if arguments[:1] == ["--"] and len(arguments) >= 2:
+        return {
+            "schemaVersion": 1,
+            "purpose": "Run the requested command with explicit arguments",
+            "program": arguments[1],
+            "args": arguments[2:],
+            "timeoutSeconds": 120,
+        }
+    raise RequestError("usage")
+
+
+def validate_request(payload: dict) -> dict:
+    purpose = clean_text(payload.get("purpose"), "purpose", 240)
+    timeout = clean_timeout(payload.get("timeoutSeconds", 120))
+    retries = payload.get("retries", 0)
+    if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 2:
+        raise RequestError("retries")
+    retry_safe = payload.get("retrySafe", False)
+    if not isinstance(retry_safe, bool) or (retries and not retry_safe):
+        raise RequestError("retry_safety")
+    wake_lock = payload.get("wakeLock", False)
+    if not isinstance(wake_lock, bool):
+        raise RequestError("wake_lock_type")
+    cwd_value = payload.get("cwd")
+    cwd = APP_ROOT if cwd_value is None else pathlib.Path(clean_text(cwd_value, "cwd", 4096)).resolve()
+    if not cwd.is_dir():
+        raise RequestError("cwd_directory")
+
+    has_script = "script" in payload
+    has_program = "program" in payload
+    if has_script == has_program:
+        raise RequestError("execution_shape")
+    script = None
+    if has_script:
+        script = script_path(payload["script"])
+        argv = [BASH, str(script)]
+        if "args" in payload:
+            argv.extend(clean_args(payload["args"]))
+    else:
+        program = clean_text(payload["program"], "program", 4096)
+        supplied_args = payload.get("args", [])
+        if not isinstance(supplied_args, list):
+            raise RequestError("argv_shape")
+        argv = [program]
+        if supplied_args:
+            argv.extend(clean_args(supplied_args))
+
+    verify = payload.get("verify")
+    if verify is not None and not isinstance(verify, dict):
+        raise RequestError("verify_shape")
+    return {
+        "purpose": purpose,
+        "timeout": timeout,
+        "retries": retries,
+        "cwd": cwd,
+        "argv": argv,
+        "script": script,
+        "verify": verify,
+        "wakeLock": wake_lock,
+    }
+
+
+def bounded(value: object) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return text
+    return text[:MAX_OUTPUT_CHARS] + "\n[…technical output truncated…]"
+
+
+def digest(path: pathlib.Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def verify_result(spec: dict | None, stdout: str) -> tuple[bool, str]:
+    if spec is None:
+        return False, "The process completed; the task effect still requires an independent readback."
+    kind = spec.get("type")
+    if kind == "json-stdout":
+        required = spec.get("required")
+        if not isinstance(required, dict) or not required:
+            raise RequestError("verify_required")
+        try:
+            value = json.loads(stdout)
+        except json.JSONDecodeError:
+            return False, "The command output was not the required JSON receipt."
+        if not isinstance(value, dict):
+            return False, "The command output was not a JSON object receipt."
+        matched = all(value.get(key) == expected for key, expected in required.items())
+        return matched, (
+            "The structured output receipt matched every required field."
+            if matched else "The structured output receipt did not match every required field."
+        )
+    if kind == "file":
+        path = pathlib.Path(clean_text(spec.get("path"), "verify_path", 4096))
+        if not path.is_absolute():
+            path = APP_ROOT / path
+        path = path.resolve()
+        if not path.is_file() or path.is_symlink():
+            return False, "The expected output file was not present."
+        expected = spec.get("sha256")
+        if expected is not None:
+            expected = clean_text(expected, "verify_sha256", 64).lower()
+            matched = len(expected) == 64 and digest(path) == expected
+            return matched, (
+                "The output file exists and its SHA-256 matches."
+                if matched else "The output file exists but its SHA-256 does not match."
+            )
+        return True, "The expected output file exists."
+    raise RequestError("verify_type")
+
+
+def run_once(request: dict) -> subprocess.CompletedProcess:
+    if request["script"] is not None:
+        syntax = subprocess.run(
+            [BASH, "-n", str(request["script"])],
+            cwd=request["cwd"],
+            capture_output=True,
+            text=True,
+            timeout=min(request["timeout"], 30),
+            check=False,
+        )
+        if syntax.returncode != 0:
+            return syntax
+    return subprocess.run(
+        request["argv"],
+        cwd=request["cwd"],
+        capture_output=True,
+        text=True,
+        timeout=request["timeout"],
+        check=False,
+    )
+
+
+@contextmanager
+def held_wake_lock(enabled: bool):
+    if not enabled:
+        yield False
+        return
+    acquire = subprocess.run(
+        [WAKE_LOCK], cwd=APP_ROOT, capture_output=True, text=True, timeout=10, check=False,
+    )
+    if acquire.returncode != 0:
+        raise RequestError("wake_lock_acquire_failed")
+    try:
+        yield True
+    finally:
+        try:
+            subprocess.run(
+                [WAKE_UNLOCK], cwd=APP_ROOT, capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # The process is still terminating; Android also releases a process-held lock.
+            pass
+
+
+def main() -> int:
+    started = time.monotonic()
+    try:
+        request = validate_request(build_request(sys.argv[1:]))
+    except RequestError as error:
+        emit({
+            "action": "Validate the structured command request",
+            "error": str(error),
+            "message": "The command was not started because its structured request was invalid.",
+            "ok": False,
+            "processCompleted": False,
+            "status": "blocked",
+            "taskVerified": False,
+        })
+        return 64
+
+    attempts = 0
+    completed = None
+    try:
+        with held_wake_lock(request["wakeLock"]):
+            for attempts in range(1, request["retries"] + 2):
+                completed = run_once(request)
+                if completed.returncode == 0:
+                    break
+    except RequestError as error:
+        emit({
+            "action": request["purpose"],
+            "attempts": attempts,
+            "durationMs": int((time.monotonic() - started) * 1000),
+            "error": str(error),
+            "message": "The command was not started because the requested wake lock could not be acquired.",
+            "ok": False,
+            "processCompleted": False,
+            "status": "blocked",
+            "taskVerified": False,
+            "wakeLockReleased": True,
+        })
+        return 69
+    except subprocess.TimeoutExpired as error:
+        emit({
+            "action": request["purpose"],
+            "attempts": attempts or 1,
+            "durationMs": int((time.monotonic() - started) * 1000),
+            "error": "timeout",
+            "message": "The command timed out; completion was not claimed.",
+            "ok": False,
+            "processCompleted": False,
+            "status": "failed",
+            "stderr": bounded(error.stderr),
+            "stdout": bounded(error.stdout),
+            "taskVerified": False,
+        })
+        return 124
+    except FileNotFoundError:
+        emit({
+            "action": request["purpose"],
+            "attempts": attempts or 1,
+            "durationMs": int((time.monotonic() - started) * 1000),
+            "error": "executable_not_found",
+            "message": "The requested executable was not found; the task was not started.",
+            "ok": False,
+            "processCompleted": False,
+            "status": "failed",
+            "taskVerified": False,
+        })
+        return 127
+
+    assert completed is not None
+    task_verified = False
+    verification = "The process failed, so the requested task was not verified."
+    if completed.returncode == 0:
+        try:
+            task_verified, verification = verify_result(request["verify"], completed.stdout)
+        except RequestError as error:
+            emit({
+                "action": request["purpose"],
+                "error": str(error),
+                "message": "The process completed, but its verification request was invalid.",
+                "ok": False,
+                "processCompleted": True,
+                "status": "verification_failed",
+                "taskVerified": False,
+            })
+            return 65
+    ok = completed.returncode == 0
+    emit({
+        "action": request["purpose"],
+        "argumentCount": max(0, len(request["argv"]) - 1),
+        "attempts": attempts,
+        "durationMs": int((time.monotonic() - started) * 1000),
+        "executable": pathlib.Path(request["argv"][0]).name,
+        "exitCode": completed.returncode,
+        "message": (
+            f"Completed: {request['purpose']}."
+            if ok else f"Failed: {request['purpose']}. No successful task result was claimed."
+        ),
+        "ok": ok,
+        "processCompleted": True,
+        "status": "completed" if ok else "failed",
+        "stderr": bounded(completed.stderr),
+        "stdout": bounded(completed.stdout),
+        "taskVerified": task_verified,
+        "verification": verification,
+        "wakeLockRequested": request["wakeLock"],
+        "wakeLockReleased": True,
+    })
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

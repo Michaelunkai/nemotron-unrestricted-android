@@ -1,0 +1,16 @@
+#!/data/data/com.termux/files/usr/bin/sh
+set -eu
+
+RUNTIME_BIN=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BASE=$(CDPATH= cd -- "$RUNTIME_BIN/../lib/rish" && pwd)
+case "$BASE" in
+  /data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/home/.local/lib/rish) ;;
+  *) printf 'Refusing non-isolated rish runtime assets.\n' >&2; exit 77 ;;
+esac
+[ -f "$BASE/rish_shizuku.dex" ] && [ ! -L "$BASE/rish_shizuku.dex" ]
+[ -f "$BASE/librish.so" ] && [ ! -L "$BASE/librish.so" ]
+export RISH_APPLICATION_ID=com.termux
+exec /system/bin/app_process \
+  -Djava.class.path="$BASE/rish_shizuku.dex" \
+  -Djava.library.path="$BASE" \
+  /system/bin --nice-name=nemotron-rish rikka.shizuku.shell.ShizukuShellLoader "$@"
