@@ -1,0 +1,225 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Bounded LAN and paired-PC discovery with structured English receipts."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+from nemotron_android_policy import AndroidBridgeError, run_rish
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+
+def parser():
+    result = argparse.ArgumentParser(prog="codex-lan-discover")
+    group = result.add_mutually_exclusive_group(required=True)
+    group.add_argument("--capabilities", action="store_true")
+    group.add_argument("--self", action="store_true")
+    group.add_argument("--neighbors", action="store_true")
+    group.add_argument("--scope")
+    group.add_argument("--tcp", nargs=2, metavar=("HOST", "PORTS"))
+    group.add_argument("--pc", action="store_true")
+    return result
+
+
+def parse_ports(value):
+    ports = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token.isdigit():
+            raise ValueError("invalid_port")
+        port = int(token)
+        if not 1 <= port <= 65535:
+            raise ValueError("invalid_port")
+        ports.append(port)
+    ports = sorted(set(ports))
+    if not 1 <= len(ports) <= 32:
+        raise ValueError("port_count")
+    return ports
+
+
+def parse_host(value):
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        if len(value) > 253 or not HOST_RE.fullmatch(value) or ".." in value:
+            raise ValueError("invalid_host")
+        return value.casefold()
+
+
+def parse_scope(value):
+    network = ipaddress.ip_network(value, strict=False)
+    if network.num_addresses > 4096:
+        raise ValueError("scope_exceeds_4096_addresses")
+    if not (network.is_private or network.is_link_local or network.is_loopback):
+        raise ValueError("scope_is_not_local")
+    return network
+
+
+def installed_capabilities():
+    commands = {
+        name: shutil.which(name) is not None
+        for name in ("nmap", "ssh", "scp", "sftp", "curl", "git", "codex-win", "codex-browser")
+    }
+    return {
+        "action": "Discover available LAN, paired-PC, file-transfer, browser, and project routes",
+        "available": commands,
+        "message": (
+            "Capability discovery completed. Each connection still requires an exact target, "
+            "authentication, and an independently verified result."
+        ),
+        "ok": True,
+        "verified": True,
+    }
+
+
+def self_receipt():
+    result = run_rish("ip -json address show wlan0; ip -json route", require_success=False)
+    ok = result.remote_status == 0
+    return {
+        "action": "Read this Android device's Wi-Fi addresses and routes",
+        "message": (
+            "The Android network addresses and routes were read successfully."
+            if ok else "Android did not return a successful network-state receipt."
+        ),
+        "ok": ok,
+        "remoteStatus": result.remote_status,
+        "result": result.stdout[:128_000],
+        "verified": ok,
+    }, 0 if ok else 5
+
+
+def neighbor_receipt():
+    result = run_rish("ip neigh show", require_success=False)
+    neighbors = []
+    if result.remote_status == 0:
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields:
+                continue
+            record = {"address": fields[0], "state": fields[-1]}
+            if "dev" in fields and fields.index("dev") + 1 < len(fields):
+                record["interface"] = fields[fields.index("dev") + 1]
+            if "lladdr" in fields and fields.index("lladdr") + 1 < len(fields):
+                record["linkAddress"] = fields[fields.index("lladdr") + 1]
+            neighbors.append(record)
+    ok = result.remote_status == 0
+    return {
+        "action": "Read the passive Android neighbor cache without probing devices",
+        "count": len(neighbors),
+        "items": neighbors,
+        "message": f"Passive LAN neighbor read completed with {len(neighbors)} entr{'y' if len(neighbors) == 1 else 'ies'}.",
+        "ok": ok,
+        "verified": ok,
+    }, 0 if ok else 5
+
+
+def nmap_receipt(arguments, action):
+    executable = shutil.which("nmap")
+    if executable is None:
+        return {
+            "action": action, "error": "nmap_unavailable",
+            "message": "The bounded network check was not started because Nmap is unavailable.",
+            "ok": False, "verified": False,
+        }, 127
+    completed = subprocess.run(
+        [executable, *arguments],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    ok = completed.returncode == 0
+    return {
+        "action": action,
+        "exitCode": completed.returncode,
+        "message": (
+            f"Completed: {action}." if ok
+            else f"Failed: {action}. No reachable-device or port result was claimed."
+        ),
+        "ok": ok,
+        "stderr": completed.stderr[:64_000],
+        "stdout": completed.stdout[:256_000],
+        "verified": ok,
+    }, completed.returncode
+
+
+def pc_receipt():
+    completed = subprocess.run(
+        [str(ROOT / "bin/codex-win"), '{"action":"diagnostics"}'],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    try:
+        value = json.loads(completed.stdout if completed.returncode == 0 else completed.stderr)
+    except json.JSONDecodeError:
+        value = {}
+    ok = completed.returncode == 0 and value.get("ok") is True and value.get("verified") is True
+    return {
+        "action": "Verify the paired PC route before Windows automation or file work",
+        "gateway": value,
+        "message": (
+            "The paired PC route, listener, and process identity are available and verified."
+            if ok else "The paired PC route is not currently verified; no PC action was attempted."
+        ),
+        "ok": ok,
+        "verified": ok,
+    }, 0 if ok else 5
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        if args.capabilities:
+            emit(installed_capabilities())
+            return 0
+        if args.self:
+            payload, status = self_receipt()
+        elif args.neighbors:
+            payload, status = neighbor_receipt()
+        elif args.scope:
+            network = parse_scope(args.scope)
+            payload, status = nmap_receipt(
+                ["-sn", "-n", "--max-retries", "1", "--host-timeout", "5s", str(network)],
+                f"Scan the explicitly requested local scope {network} for reachable hosts",
+            )
+        elif args.tcp:
+            host = parse_host(args.tcp[0])
+            ports = parse_ports(args.tcp[1])
+            payload, status = nmap_receipt(
+                ["-sT", "-Pn", "-n", "--max-retries", "1", "--host-timeout", "15s",
+                 "-p", ",".join(map(str, ports)), host],
+                f"Check {host} on {len(ports)} explicitly requested TCP port{'s' if len(ports) != 1 else ''}",
+            )
+        else:
+            payload, status = pc_receipt()
+        emit(payload)
+        return status
+    except (ValueError, AndroidBridgeError, OSError, subprocess.TimeoutExpired) as error:
+        emit({
+            "action": "Validate and run the bounded connection check",
+            "error": str(error),
+            "message": "The connection check was blocked or failed before a verified result was available.",
+            "ok": False,
+            "verified": False,
+        })
+        return 77
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

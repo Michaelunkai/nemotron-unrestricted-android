@@ -1,0 +1,143 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Refresh safe durable gateway, capability, runtime, and package inventories."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+from nemotron_automation import AutomationState
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PC = os.environ.get("NEMOTRON_PC_COMMAND", str(ROOT / "bin" / "codex-pc"))
+DOCTOR = os.environ.get("NEMOTRON_DOCTOR_COMMAND", str(ROOT / "bin" / "codex-doctor"))
+DPKG = os.environ.get("NEMOTRON_DPKG_QUERY", "/data/data/com.termux/files/usr/bin/dpkg-query")
+CAPABILITIES = ROOT / "capabilities" / "capability-matrix.json"
+
+
+def run_json(argv, timeout):
+    result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"inventory_command_failed:{pathlib.Path(argv[0]).name}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("inventory_receipt_invalid") from error
+
+
+def gateway_identity(receipt):
+    if receipt.get("verified") is not True or receipt.get("taskVerified") is not True:
+        raise RuntimeError("gateway_identity_unverified")
+    return {
+        "computer": receipt.get("computer"),
+        "user": receipt.get("user"),
+        "tailnetAddress": receipt.get("tailnetAddress"),
+        "port": receipt.get("port"),
+        "gateway": receipt.get("gateway"),
+        "companion": receipt.get("companion"),
+        "elevated": receipt.get("elevated"),
+    }
+
+
+def packages():
+    result = subprocess.run(
+        [DPKG, "-W", "-f=${binary:Package}\t${Version}\n"],
+        cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("package_inventory_failed")
+    return [
+        {"name": name, "version": version}
+        for line in result.stdout.splitlines() if "\t" in line
+        for name, version in [line.split("\t", 1)]
+    ]
+
+
+def refresh():
+    state = AutomationState()
+    pc = run_json([PC, "status", "--fresh", "--timeout", "5"], 25)
+    identity = gateway_identity(pc)
+    previous = state.cache_get("inventory", "gateway")
+    identity_changed = bool(previous and previous["value"] != identity)
+    if identity_changed:
+        for namespace, key in (
+            ("pc_gateway", "status"), ("pc_gateway", "diagnostics"),
+            ("pc_routes", "selected"),
+        ):
+            state.cache_delete(namespace, key)
+    doctor = run_json([DOCTOR, "all", "--json"], 60)
+    capability_payload = json.loads(CAPABILITIES.read_text(encoding="utf-8"))
+    capability_inventory = {
+        "sha256": hashlib.sha256(CAPABILITIES.read_bytes()).hexdigest(),
+        "schemaVersion": capability_payload.get("schemaVersion"),
+        "capabilities": [
+            {"id": row.get("id"), "status": row.get("status"), "commands": row.get("commands", [])}
+            for row in capability_payload.get("capabilities", [])
+        ],
+    }
+    package_inventory = packages()
+    state.cache_set("inventory", "gateway", identity, 300)
+    state.cache_set("inventory", "capabilities", capability_inventory, 3600)
+    state.cache_set("inventory", "packages", package_inventory, 43_200)
+    state.cache_set("inventory", "environment", {
+        "environment": doctor.get("environment"),
+        "performance": doctor.get("performance"),
+        "android": doctor.get("android"),
+    }, 3600)
+    state.increment("inventory_refresh")
+    return {
+        "schemaVersion": 1, "action": "Refresh safe automation inventories",
+        "processCompleted": True, "taskVerified": True,
+        "identityChanged": identity_changed, "gateway": identity,
+        "capabilityCount": len(capability_inventory["capabilities"]),
+        "packageCount": len(package_inventory),
+        "freshnessSeconds": {
+            "gateway": 300, "capabilities": 3600,
+            "environment": 3600, "packages": 43_200,
+        },
+        "message": "Refreshed safe gateway, capability, environment, and package inventories with explicit TTLs.",
+    }
+
+
+def status():
+    state = AutomationState()
+    inventories = {}
+    for key in ("gateway", "capabilities", "packages", "environment"):
+        value = state.cache_get("inventory", key)
+        inventories[key] = {
+            "present": value is not None,
+            "ageSeconds": value.get("ageSeconds") if value else None,
+            "expiresAtEpoch": value.get("expiresAtEpoch") if value else None,
+            "value": value.get("value") if value else None,
+        }
+    verified = all(row["present"] for row in inventories.values())
+    return {
+        "schemaVersion": 1, "action": "Inspect safe automation inventories",
+        "processCompleted": True, "taskVerified": verified,
+        "inventories": inventories,
+        "message": "Every required inventory is fresh." if verified else "One or more inventories are absent or expired.",
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-inventory",
+        description="Refresh or inspect TTL-bound gateway, capability, environment, and package inventories.",
+    )
+    parser.add_argument("command", choices=("refresh", "status"))
+    args = parser.parse_args()
+    try:
+        print(json.dumps(refresh() if args.command == "refresh" else status(), ensure_ascii=False, sort_keys=True))
+        return 0
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "error": str(error), "message": "Inventory refresh stopped safely."}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

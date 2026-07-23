@@ -1,0 +1,38 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Guarded local Android package-manager route with explicit remote status."""
+
+import shlex
+import sys
+
+from nemotron_android_policy import (
+    AndroidBridgeError,
+    AndroidPolicyError,
+    run_rish,
+    sanitized_policy_message,
+    validate_pm_arguments,
+)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in {"--help", "-h"}:
+        print("usage: codex-pm <package-manager-command> [arguments]")
+        return 0
+    try:
+        validate_pm_arguments(args)
+        result = run_rish("pm " + shlex.join(args), require_success=False)
+        if result.stdout:
+            sys.stdout.write(result.stdout + "\n")
+        if result.stderr:
+            sys.stderr.write(result.stderr + "\n")
+        return result.remote_status
+    except AndroidPolicyError as error:
+        print(sanitized_policy_message(error), file=sys.stderr)
+        return 77
+    except AndroidBridgeError as error:
+        print(f"Android package-manager bridge failed ({error.code}).", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

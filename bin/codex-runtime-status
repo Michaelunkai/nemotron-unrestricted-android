@@ -1,0 +1,89 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Read the authoritative provider/model/effort identity from the local proxy."""
+
+import json
+import os
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.request
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PORTS_PATH = ROOT / "runtime" / ".codex" / "supervisor" / "ports.env"
+
+
+def usage():
+    print("usage: codex-runtime-status")
+
+
+def proxy_port():
+    try:
+        text = PORTS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return 18774
+    match = re.search(r"^NEMOTRON_PROXY_PORT=(\d+)$", text, re.MULTILINE)
+    if not match:
+        return 18774
+    value = int(match.group(1))
+    return value if 1 <= value <= 65535 else 18774
+
+
+def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1:] in (["-h"], ["--help"]):
+            usage()
+            return 0
+        usage()
+        return 2
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{proxy_port()}/v1/runtime-selection",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            value = json.loads(response.read(64 * 1024).decode("utf-8"))
+    except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError):
+        print(json.dumps({"ok": False, "error": "runtime_identity_unavailable", "verified": False}))
+        return 5
+    valid = bool(
+        isinstance(value, dict)
+        and value.get("status") == "ok"
+        and value.get("app") == "nemotron-unrestricted"
+        and isinstance(value.get("verificationStatus"), str)
+    )
+    value = {
+        "ok": valid,
+        "verificationStatus": value.get("verificationStatus") if isinstance(value, dict) else None,
+        "provider": value.get("provider") if isinstance(value, dict) else None,
+        "model": value.get("model") if isinstance(value, dict) else None,
+        "effort": value.get("effort") if isinstance(value, dict) else None,
+        "requestedProvider": value.get("requestedProvider") if isinstance(value, dict) else None,
+        "requestedModel": value.get("requestedModel") if isinstance(value, dict) else None,
+        "requestedEffort": value.get("requestedEffort") if isinstance(value, dict) else None,
+        "effectiveProvider": value.get("effectiveProvider") if isinstance(value, dict) else None,
+        "effectiveGateway": value.get("effectiveGateway") if isinstance(value, dict) else None,
+        "effectiveModel": value.get("effectiveModel") if isinstance(value, dict) else None,
+        "effectiveEffort": value.get("effectiveEffort") if isinstance(value, dict) else None,
+        "requestedReasoningBudget": value.get("requestedReasoningBudget") if isinstance(value, dict) else None,
+        "reasoningBudget": value.get("reasoningBudget") if isinstance(value, dict) else None,
+        "effectiveReasoningTokens": value.get("effectiveReasoningTokens") if isinstance(value, dict) else None,
+        "requestId": value.get("requestId") if isinstance(value, dict) else None,
+        "responseId": value.get("responseId") if isinstance(value, dict) else None,
+        "failureType": value.get("failureType") if isinstance(value, dict) else None,
+        "identityVerified": value.get("identityVerified") is True if isinstance(value, dict) else False,
+        "effortVerified": value.get("effortVerified") is True if isinstance(value, dict) else False,
+        "activeTurnCount": value.get("activeTurnCount") if isinstance(value, dict) else None,
+        "trackedTurnCount": value.get("trackedTurnCount") if isinstance(value, dict) else None,
+        "currentTurn": value.get("currentTurn") if isinstance(value, dict) else None,
+        "modelSubstitution": value.get("modelSubstitution") if isinstance(value, dict) else None,
+        "verified": value.get("verified") is True if isinstance(value, dict) else False,
+    }
+    print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+    return 0 if valid else 5
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,84 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Credential-safe Git/GitHub work through the paired Windows gateway."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+
+PROJECT_WIN = "/data/data/com.termux/files/home/nemotron-unrestricted-app/bin/codex-win"
+
+
+def usage():
+    print("usage: codex-github status | run <direct git-or-gh command>")
+
+
+def emit(payload, stream=sys.stdout):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True), file=stream)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help"}:
+        usage()
+        return 0
+    action = args.pop(0)
+    if action == "status" and not args:
+        payload = json.dumps({"action": "powershell_github_status"}, separators=(",", ":"))
+        completed = subprocess.run(
+            [PROJECT_WIN, payload, "--timeout", "15"],
+            env=os.environ,
+            capture_output=True,
+            text=True,
+            timeout=35,
+            check=False,
+        )
+        try:
+            gateway = json.loads(completed.stdout)
+            status = json.loads(gateway.get("stdout", ""))
+        except (AttributeError, json.JSONDecodeError):
+            gateway = None
+            status = None
+        transport_verified = bool(
+            completed.returncode == 0
+            and isinstance(gateway, dict)
+            and gateway.get("ok") is True
+            and gateway.get("exitCode") == 0
+        )
+        verified = bool(
+            transport_verified
+            and isinstance(status, dict)
+            and status.get("ok") is True
+            and status.get("verified") is True
+            and isinstance(status.get("gitAvailable"), bool)
+            and isinstance(status.get("ghAvailable"), bool)
+            and isinstance(status.get("authenticated"), bool)
+        )
+        result = {
+            "ok": verified,
+            "gitAvailable": status.get("gitAvailable") if isinstance(status, dict) else None,
+            "ghAvailable": status.get("ghAvailable") if isinstance(status, dict) else None,
+            "authenticated": status.get("authenticated") if isinstance(status, dict) else None,
+            "gatewayVerified": transport_verified,
+            "verified": verified,
+        }
+        if not verified:
+            result["error"] = "github_status_unverified"
+        emit(result, sys.stdout if verified else sys.stderr)
+        return 0 if verified else 5
+    if action == "run" and args:
+        command = args[0] if len(args) == 1 else " ".join(args)
+        payload = json.dumps(
+            {"action": "powershell_github", "command": command},
+            separators=(",", ":"),
+        )
+        return subprocess.call([PROJECT_WIN, payload], env=os.environ)
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

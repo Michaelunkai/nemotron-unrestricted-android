@@ -1,0 +1,234 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Hash-gated semantic versioning, release notes, APK metadata, and rollback."""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+DEFAULT_ROOT = pathlib.Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(os.environ.get("NEMOTRON_RELEASE_ROOT", str(DEFAULT_ROOT))).resolve()
+STATE = ROOT / "runtime" / ".codex" / "automation" / "releases"
+SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?$")
+
+
+class ReleaseError(Exception):
+    pass
+
+
+def atomic_text(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    temporary = path.with_name(path.name + ".partial")
+    temporary.write_text(value, encoding="utf-8")
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def parse_manifest():
+    text = (ROOT / "AndroidManifest.xml").read_text(encoding="utf-8")
+    code = re.search(r'android:versionCode="(\d+)"', text)
+    name = re.search(r'android:versionName="([^"]+)"', text)
+    if not code or not name or not SEMVER.fullmatch(name.group(1)):
+        raise ReleaseError("current_version_unavailable")
+    return int(code.group(1)), name.group(1)
+
+
+def version_tuple(value):
+    match = SEMVER.fullmatch(value)
+    if not match:
+        raise ReleaseError("version_invalid")
+    return tuple(map(int, match.group(1, 2, 3)))
+
+
+def make_plan(version, code, changes):
+    current_code, current_version = parse_manifest()
+    if version_tuple(version) <= version_tuple(current_version) or code <= current_code:
+        raise ReleaseError("version_not_increasing")
+    if not 1 <= len(changes) <= 100 or any(not value.strip() or len(value) > 300 for value in changes):
+        raise ReleaseError("changes_invalid")
+    return {
+        "schemaVersion": 1, "currentVersion": current_version, "currentVersionCode": current_code,
+        "nextVersion": version, "nextVersionCode": code, "changes": changes,
+        "files": ["AndroidManifest.xml", "build-nemotron-unrestricted.sh", "release-nemotron-gate.sh", "CHANGELOG.md", f"release-notes/{version}.md"],
+    }
+
+
+def plan_sha(plan):
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def replace_once(text, pattern, replacement, label):
+    result, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+    if count != 1:
+        raise ReleaseError(label + "_pattern_mismatch")
+    return result
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Plan/prepare/rollback semantic releases and verify APK assets.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("plan", "prepare"):
+        command = commands.add_parser(name)
+        command.add_argument("--version", required=True)
+        command.add_argument("--version-code", type=int, required=True)
+        command.add_argument("--change", action="append", required=True)
+        if name == "prepare":
+            command.add_argument("--plan-sha256", required=True)
+    asset = commands.add_parser("asset")
+    asset.add_argument("apk")
+    asset.add_argument("--package", required=True)
+    asset.add_argument("--version", required=True)
+    rollback = commands.add_parser("rollback")
+    rollback.add_argument("receipt")
+    args = parser.parse_args()
+    try:
+        if args.command in {"plan", "prepare"}:
+            plan = make_plan(args.version, args.version_code, args.change)
+            digest = plan_sha(plan)
+            if args.command == "plan":
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "dryRun": True, "plan": plan, "planSha256": digest,
+                    "message": "Validated the increasing semantic version, Android code, release files, and notes without writing.",
+                }
+            else:
+                if args.plan_sha256 != digest:
+                    raise ReleaseError("plan_hash_mismatch")
+                release_id = uuid.uuid4().hex
+                backup_root = STATE / "backups" / release_id
+                original = {}
+                for relative in plan["files"][:3] + ["CHANGELOG.md"]:
+                    path = ROOT / relative
+                    if path.exists():
+                        destination = backup_root / relative
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(path, destination)
+                        original[relative] = {"existed": True, "sha256": sha256(path)}
+                    else:
+                        original[relative] = {"existed": False, "sha256": None}
+                manifest = (ROOT / "AndroidManifest.xml").read_text(encoding="utf-8")
+                manifest = replace_once(manifest, r'android:versionCode="\d+"', f'android:versionCode="{plan["nextVersionCode"]}"', "manifest_code")
+                manifest = replace_once(manifest, r'android:versionName="[^"]+"', f'android:versionName="{plan["nextVersion"]}"', "manifest_name")
+                build = (ROOT / "build-nemotron-unrestricted.sh").read_text(encoding="utf-8")
+                build = replace_once(build, r'^VERSION_CODE="\d+"$', f'VERSION_CODE="{plan["nextVersionCode"]}"', "build_code")
+                build = replace_once(build, r'^VERSION_NAME="[^"]+"$', f'VERSION_NAME="{plan["nextVersion"]}"', "build_name")
+                gate = (ROOT / "release-nemotron-gate.sh").read_text(encoding="utf-8")
+                gate = replace_once(gate, r'APK="\$APP_HOME/dist/Nemotron-Unrestricted-[^"]+\.apk"', f'APK="$APP_HOME/dist/Nemotron-Unrestricted-{plan["nextVersion"]}.apk"', "gate_apk")
+                gate = replace_once(
+                    gate,
+                    r"versionCode='\d+' versionName='[^']+'",
+                    f"versionCode='{plan['nextVersionCode']}' versionName='{plan['nextVersion']}'",
+                    "gate_version",
+                )
+                date = dt.datetime.now(dt.timezone.utc).date().isoformat()
+                bullets = "\n".join("- " + value for value in plan["changes"])
+                heading = f"## {plan['nextVersion']} — {date}\n\n{bullets}\n\n"
+                changelog_path = ROOT / "CHANGELOG.md"
+                old_changelog = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else "# Changelog\n\n"
+                if old_changelog.startswith("# Changelog\n"):
+                    changelog = "# Changelog\n\n" + heading + old_changelog[len("# Changelog\n"):].lstrip("\n")
+                else:
+                    changelog = "# Changelog\n\n" + heading + old_changelog
+                notes = (
+                    f"# Nemotron Unrestricted {plan['nextVersion']}\n\n"
+                    f"Android version code: {plan['nextVersionCode']}\n\n## Changes\n\n{bullets}\n\n"
+                    "The APK release asset must pass alignment, signature, package, version, and SHA-256 verification before publication.\n"
+                )
+                atomic_text(ROOT / "AndroidManifest.xml", manifest)
+                atomic_text(ROOT / "build-nemotron-unrestricted.sh", build)
+                atomic_text(ROOT / "release-nemotron-gate.sh", gate)
+                atomic_text(changelog_path, changelog.rstrip() + "\n")
+                atomic_text(ROOT / "release-notes" / f"{plan['nextVersion']}.md", notes)
+                after_code, after_version = parse_manifest()
+                if (after_code, after_version) != (plan["nextVersionCode"], plan["nextVersion"]):
+                    raise ReleaseError("release_readback_mismatch")
+                resulting = {relative: sha256(ROOT / relative) for relative in plan["files"]}
+                record = {
+                    "schemaVersion": 1, "id": release_id, "plan": plan, "planSha256": digest,
+                    "backupRoot": str(backup_root), "original": original, "resulting": resulting,
+                }
+                receipt = STATE / f"{release_id}.json"
+                atomic_text(receipt, json.dumps(record, indent=2, sort_keys=True) + "\n")
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "receipt": str(receipt), "record": record,
+                    "message": "Updated and independently read back the semantic version, build gate, changelog, and release notes.",
+                }
+        elif args.command == "asset":
+            apk = pathlib.Path(args.apk).expanduser().resolve(strict=True)
+            if apk.suffix.lower() != ".apk" or not apk.is_file() or apk.is_symlink():
+                raise ReleaseError("apk_invalid")
+            if not SEMVER.fullmatch(args.version):
+                raise ReleaseError("version_invalid")
+            badging = subprocess.run(["aapt", "dump", "badging", str(apk)], capture_output=True, text=True, timeout=60, check=False)
+            signature = subprocess.run(["apksigner", "verify", "--verbose", "--print-certs", str(apk)], capture_output=True, text=True, timeout=60, check=False)
+            if badging.returncode or signature.returncode:
+                raise ReleaseError("apk_verification_failed")
+            if f"package: name='{args.package}'" not in badging.stdout or f"versionName='{args.version}'" not in badging.stdout:
+                raise ReleaseError("apk_identity_mismatch")
+            signer = re.search(r"certificate SHA-256 digest: ([0-9a-fA-F]{64})", signature.stdout)
+            if not signer:
+                raise ReleaseError("apk_signer_unavailable")
+            metadata = {
+                "schemaVersion": 1, "name": apk.name, "bytes": apk.stat().st_size,
+                "sha256": sha256(apk), "package": args.package, "version": args.version,
+                "signerSha256": signer.group(1).lower(), "signatureVerified": True,
+            }
+            atomic_text(apk.with_suffix(apk.suffix + ".release.json"), json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "asset": metadata, "message": "Verified the APK package, version, signature, signer, size, and SHA-256 release metadata.",
+            }
+        else:
+            receipt = pathlib.Path(args.receipt).expanduser().resolve(strict=True)
+            if receipt.parent != STATE.resolve():
+                raise ReleaseError("receipt_outside_state")
+            record = json.loads(receipt.read_text(encoding="utf-8"))
+            for relative, expected in record["resulting"].items():
+                path = ROOT / relative
+                if not path.is_file() or sha256(path) != expected:
+                    raise ReleaseError("release_files_changed")
+            for relative, original in record["original"].items():
+                path = ROOT / relative
+                if original["existed"]:
+                    shutil.copyfile(pathlib.Path(record["backupRoot"]) / relative, path)
+                elif path.exists():
+                    path.unlink()
+            notes = ROOT / "release-notes" / f"{record['plan']['nextVersion']}.md"
+            if notes.exists():
+                notes.unlink()
+            output = {
+                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                "message": "Restored only the unchanged release files recorded by the preparation receipt.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (ReleaseError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Release automation stopped without claiming an unverified version or asset.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

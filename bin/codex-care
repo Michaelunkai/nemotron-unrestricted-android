@@ -1,0 +1,533 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Encrypted backup, restore, retention, database, and recovery care."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+import zipfile
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from nemotron_automation import atomic_write
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+RUNTIME = ROOT / "runtime" / ".codex"
+STATE = RUNTIME / "automation" / "care"
+BACKUP_ROOT = ROOT / "runtime" / "home" / "Backups" / "Nemotron"
+RESTORE_ROOTS = (ROOT / "workspace", ROOT / "build", ROOT / "runtime" / "home" / "Documents")
+INCLUDE = (
+    RUNTIME / "config.toml",
+    RUNTIME / "webui-custom-providers.json",
+    RUNTIME / "automation",
+    RUNTIME / "memory",
+    RUNTIME / "skills",
+    RUNTIME / "sessions",
+    RUNTIME / "archived_sessions",
+    ROOT / "runtime" / "home" / ".codex" / "memory",
+    ROOT / "runtime" / "home" / ".codex" / "skills",
+)
+EXCLUDED_NAMES = {".tmp", "__pycache__", "cache", "node_modules", "care"}
+MAX_BACKUP_BYTES = 1024 * 1024 * 1024
+MAGIC = b"NEMOTRON-BACKUP-1\n"
+
+
+class CareError(ValueError):
+    pass
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def relative(path: pathlib.Path) -> str:
+    return path.resolve().relative_to(ROOT).as_posix()
+
+
+def backup_files() -> list[pathlib.Path]:
+    files = []
+    for source in INCLUDE:
+        if not source.exists() or source.is_symlink():
+            continue
+        candidates = [source] if source.is_file() else sorted(source.rglob("*"))
+        for candidate in candidates:
+            if any(part in EXCLUDED_NAMES for part in candidate.relative_to(ROOT).parts):
+                continue
+            if candidate.is_symlink():
+                raise CareError("backup_symlink_refused")
+            if candidate.is_file():
+                files.append(candidate)
+    unique = sorted(set(files))
+    total = sum(path.stat().st_size for path in unique)
+    if total > MAX_BACKUP_BYTES:
+        raise CareError("backup_size_limit")
+    return unique
+
+
+def passphrase() -> bytes:
+    value = sys.stdin.buffer.readline(4097).rstrip(b"\r\n")
+    if not 16 <= len(value) <= 4096:
+        raise CareError("backup_passphrase_length")
+    return value
+
+
+def derive(secret: bytes, salt: bytes) -> bytes:
+    return hashlib.scrypt(
+        secret,
+        salt=salt,
+        n=2**15,
+        r=8,
+        p=1,
+        dklen=32,
+        maxmem=128 * 1024 * 1024,
+    )
+
+
+def allowed_backup(value: str, *, existing: bool = False) -> pathlib.Path:
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute():
+        path = BACKUP_ROOT / path
+    resolved = path.resolve(strict=existing)
+    backup_root = BACKUP_ROOT.resolve()
+    if resolved != backup_root and backup_root not in resolved.parents:
+        raise CareError("backup_path_outside_managed_root")
+    if existing and (path.is_symlink() or not resolved.is_file()):
+        raise CareError("backup_file_invalid")
+    return resolved
+
+
+def allowed_restore(value: str) -> pathlib.Path:
+    path = pathlib.Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT / "workspace" / value
+    resolved = path.resolve()
+    if not any(resolved == root.resolve() or root.resolve() in resolved.parents for root in RESTORE_ROOTS):
+        raise CareError("restore_path_outside_managed_roots")
+    if resolved.exists() or path.is_symlink():
+        raise CareError("restore_destination_exists")
+    return resolved
+
+
+def build_plain_archive() -> tuple[bytes, dict]:
+    files = backup_files()
+    with tempfile.NamedTemporaryFile(prefix=".care-", suffix=".zip", dir=ROOT / "build", delete=False) as handle:
+        temporary = pathlib.Path(handle.name)
+    try:
+        manifest = {
+            "schemaVersion": 1,
+            "createdEpoch": int(time.time()),
+            "files": [
+                {"path": relative(path), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
+                for path in files
+            ],
+        }
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("MANIFEST.json", json.dumps(manifest, sort_keys=True))
+            for path in files:
+                archive.write(path, relative(path))
+        payload = temporary.read_bytes()
+        manifest["archiveSha256"] = sha256_bytes(payload)
+        return payload, manifest
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def encrypt(payload: bytes, secret: bytes, manifest: dict) -> tuple[bytes, dict]:
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    header = {
+        "schemaVersion": 1,
+        "cipher": "AES-256-GCM",
+        "kdf": "scrypt-n32768-r8-p1",
+        "salt": base64.b64encode(salt).decode(),
+        "nonce": base64.b64encode(nonce).decode(),
+        "fileCount": len(manifest["files"]),
+        "plaintextSha256": sha256_bytes(payload),
+        "createdEpoch": manifest["createdEpoch"],
+    }
+    encoded = json.dumps(header, separators=(",", ":"), sort_keys=True).encode()
+    ciphertext = AESGCM(derive(secret, salt)).encrypt(nonce, payload, MAGIC + encoded)
+    return MAGIC + len(encoded).to_bytes(4, "big") + encoded + ciphertext, header
+
+
+def decrypt(path: pathlib.Path, secret: bytes) -> tuple[bytes, dict]:
+    value = path.read_bytes()
+    if not value.startswith(MAGIC) or len(value) < len(MAGIC) + 4:
+        raise CareError("backup_format_invalid")
+    offset = len(MAGIC)
+    header_length = int.from_bytes(value[offset : offset + 4], "big")
+    if not 1 <= header_length <= 16_384:
+        raise CareError("backup_header_invalid")
+    encoded = value[offset + 4 : offset + 4 + header_length]
+    try:
+        header = json.loads(encoded)
+        salt = base64.b64decode(header["salt"], validate=True)
+        nonce = base64.b64decode(header["nonce"], validate=True)
+        plaintext = AESGCM(derive(secret, salt)).decrypt(
+            nonce, value[offset + 4 + header_length :], MAGIC + encoded
+        )
+    except Exception as error:
+        raise CareError("backup_authentication_failed") from error
+    if sha256_bytes(plaintext) != header.get("plaintextSha256"):
+        raise CareError("backup_plaintext_hash_mismatch")
+    return plaintext, header
+
+
+def validate_plain(plaintext: bytes) -> dict:
+    with tempfile.NamedTemporaryFile(prefix=".care-verify-", suffix=".zip", dir=ROOT / "build", delete=False) as handle:
+        path = pathlib.Path(handle.name)
+        handle.write(plaintext)
+    try:
+        if not zipfile.is_zipfile(path):
+            raise CareError("backup_archive_invalid")
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            if "MANIFEST.json" not in names or len(names) > 100_000:
+                raise CareError("backup_manifest_missing")
+            for name in names:
+                member = pathlib.PurePosixPath(name)
+                if member.is_absolute() or ".." in member.parts or "\\" in name:
+                    raise CareError("backup_member_invalid")
+            manifest = json.loads(archive.read("MANIFEST.json"))
+            if manifest.get("schemaVersion") != 1 or not isinstance(manifest.get("files"), list):
+                raise CareError("backup_manifest_invalid")
+            expected = {item["path"]: item for item in manifest["files"]}
+            if set(names) - {"MANIFEST.json"} != set(expected):
+                raise CareError("backup_file_set_mismatch")
+            for name, item in expected.items():
+                value = archive.read(name)
+                if len(value) != item["bytes"] or sha256_bytes(value) != item["sha256"]:
+                    raise CareError("backup_file_hash_mismatch")
+        return manifest
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, KeyError, TypeError) as error:
+        if isinstance(error, CareError):
+            raise
+        raise CareError("backup_archive_invalid") from error
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def database_checks() -> list[dict]:
+    results = []
+    for path in sorted(RUNTIME.rglob("*.db")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as connection:
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            results.append({"path": relative(path), "integrity": integrity, "bytes": path.stat().st_size})
+        except sqlite3.Error as error:
+            results.append({"path": relative(path), "integrity": "error", "error": type(error).__name__})
+    return results
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Create and verify encrypted backups, isolated restores, retention plans, and recovery drills."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    backup = commands.add_parser("backup")
+    backup.add_argument("output")
+    verify = commands.add_parser("verify")
+    verify.add_argument("backup")
+    restore = commands.add_parser("restore")
+    restore.add_argument("backup")
+    restore.add_argument("destination")
+    drill = commands.add_parser("recovery-drill")
+    drill.add_argument("backup")
+    retention_plan = commands.add_parser("retention-plan")
+    retention_plan.add_argument("--days", type=int, default=30)
+    retention_plan.add_argument("--output", required=True)
+    retention_apply = commands.add_parser("retention-apply")
+    retention_apply.add_argument("--plan", required=True)
+    retention_apply.add_argument("--sha256", required=True)
+    upkeep_plan = commands.add_parser("upkeep-plan")
+    upkeep_plan.add_argument("--log-days", type=int, default=7)
+    upkeep_plan.add_argument("--output", required=True)
+    upkeep_apply = commands.add_parser("upkeep-apply")
+    upkeep_apply.add_argument("--plan", required=True)
+    upkeep_apply.add_argument("--sha256", required=True)
+    commands.add_parser("database-check")
+    args = parser.parse_args()
+    try:
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if args.command in {"status", "database-check"}:
+            databases = database_checks()
+            verified = all(item["integrity"] == "ok" for item in databases)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": verified,
+                "databases": databases,
+                "backupCount": len(list(BACKUP_ROOT.glob("*.nmbak"))),
+                "message": "Read every automation SQLite integrity result and backup count without mutation.",
+            }
+        elif args.command == "backup":
+            destination = allowed_backup(args.output)
+            if destination.suffix != ".nmbak":
+                raise CareError("backup_extension_required")
+            if destination.exists() or destination.is_symlink():
+                raise CareError("backup_destination_exists")
+            secret = passphrase()
+            plaintext, manifest = build_plain_archive()
+            encrypted, header = encrypt(plaintext, secret, manifest)
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            atomic_write(destination, encrypted)
+            os.chmod(destination, 0o600)
+            verified_plain, _ = decrypt(destination, secret)
+            verified_manifest = validate_plain(verified_plain)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": verified_manifest == {key: manifest[key] for key in ("schemaVersion", "createdEpoch", "files")},
+                "backup": str(destination),
+                "bytes": destination.stat().st_size,
+                "sha256": sha256_file(destination),
+                "fileCount": header["fileCount"],
+                "cipher": header["cipher"],
+                "message": "Created the encrypted backup and authenticated every archived file by checksum.",
+            }
+        elif args.command in {"verify", "recovery-drill", "restore"}:
+            source = allowed_backup(args.backup, existing=True)
+            secret = passphrase()
+            plaintext, header = decrypt(source, secret)
+            manifest = validate_plain(plaintext)
+            if args.command == "restore":
+                destination = allowed_restore(args.destination)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                staging = pathlib.Path(tempfile.mkdtemp(prefix="." + destination.name + ".", dir=destination.parent))
+                try:
+                    with tempfile.NamedTemporaryFile(prefix=".restore-", suffix=".zip", dir=ROOT / "build", delete=False) as handle:
+                        archive_path = pathlib.Path(handle.name)
+                        handle.write(plaintext)
+                    try:
+                        with zipfile.ZipFile(archive_path) as archive:
+                            for item in manifest["files"]:
+                                target = staging.joinpath(*pathlib.PurePosixPath(item["path"]).parts)
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                with archive.open(item["path"]) as input_stream, target.open("xb") as output_stream:
+                                    shutil.copyfileobj(input_stream, output_stream)
+                                if sha256_file(target) != item["sha256"]:
+                                    raise CareError("restore_hash_mismatch")
+                    finally:
+                        archive_path.unlink(missing_ok=True)
+                    os.replace(staging, destination)
+                finally:
+                    if staging.exists():
+                        shutil.rmtree(staging)
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": True,
+                    "destination": str(destination),
+                    "fileCount": len(manifest["files"]),
+                    "message": "Restored into a new isolated directory and verified every file checksum without touching live state.",
+                }
+            else:
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": True,
+                    "backup": str(source),
+                    "fileCount": len(manifest["files"]),
+                    "plaintextSha256": header["plaintextSha256"],
+                    "drill": args.command == "recovery-drill",
+                    "message": "Authenticated, decrypted, reopened, and checksum-verified the backup without restoring live state.",
+                }
+        elif args.command in {"retention-plan", "upkeep-plan"}:
+            if args.command == "upkeep-plan":
+                if not 1 <= args.log_days <= 3650:
+                    raise CareError("upkeep_log_days_invalid")
+                database = RUNTIME / "automation" / "state.db"
+                cutoff = int(time.time()) - args.log_days * 86400
+                expired_cache = 0
+                if database.is_file() and not database.is_symlink():
+                    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                        expired_cache = connection.execute(
+                            "SELECT COUNT(*) FROM cache WHERE expires_at IS NOT NULL AND expires_at<=?",
+                            (int(time.time()),),
+                        ).fetchone()[0]
+                log_candidates = []
+                logs_root = RUNTIME / "automation"
+                for path in sorted(logs_root.rglob("*.jsonl")):
+                    if path.is_file() and not path.is_symlink() and int(path.stat().st_mtime) < cutoff:
+                        log_candidates.append(
+                            {"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size}
+                        )
+                plan = {
+                    "schemaVersion": 1,
+                    "kind": "upkeep",
+                    "createdEpoch": int(time.time()),
+                    "expiresEpoch": int(time.time()) + 3600,
+                    "database": str(database),
+                    "databaseSha256": sha256_file(database) if database.is_file() else None,
+                    "expiredCacheEntries": expired_cache,
+                    "logCandidates": log_candidates,
+                }
+                plan_path = pathlib.Path(args.output).expanduser().resolve()
+                if ROOT / "build" not in plan_path.parents or plan_path.exists():
+                    raise CareError("upkeep_plan_path_invalid")
+                atomic_write(plan_path, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": True,
+                    "plan": str(plan_path),
+                    "planSha256": sha256_file(plan_path),
+                    "expiredCacheEntries": expired_cache,
+                    "logCandidateCount": len(log_candidates),
+                    "message": "Created a one-hour hash-bound cache/log upkeep plan without changing runtime state.",
+                }
+                print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+                return 0
+            if not 1 <= args.days <= 3650:
+                raise CareError("retention_days_invalid")
+            cutoff = int(time.time()) - args.days * 86400
+            candidates = []
+            for path in sorted(BACKUP_ROOT.glob("*.nmbak")):
+                if path.is_file() and not path.is_symlink() and int(path.stat().st_mtime) < cutoff:
+                    candidates.append({"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size})
+            plan = {
+                "schemaVersion": 1,
+                "createdEpoch": int(time.time()),
+                "days": args.days,
+                "candidates": candidates,
+            }
+            plan_path = pathlib.Path(args.output).expanduser().resolve()
+            if ROOT / "build" not in plan_path.parents or plan_path.exists():
+                raise CareError("retention_plan_path_invalid")
+            atomic_write(plan_path, (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode())
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "plan": str(plan_path),
+                "planSha256": sha256_file(plan_path),
+                "candidateCount": len(candidates),
+                "message": "Created a hash-bound retention plan without moving or deleting a backup.",
+            }
+        elif args.command == "retention-apply":
+            plan_path = pathlib.Path(args.plan).expanduser().resolve(strict=True)
+            if ROOT / "build" not in plan_path.parents or plan_path.is_symlink():
+                raise CareError("retention_plan_path_invalid")
+            if sha256_file(plan_path) != args.sha256.lower():
+                raise CareError("retention_plan_hash_mismatch")
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            retired = BACKUP_ROOT / "retired"
+            retired.mkdir(mode=0o700, exist_ok=True)
+            moved = []
+            for item in plan.get("candidates", []):
+                source = allowed_backup(item["path"], existing=True)
+                if sha256_file(source) != item["sha256"]:
+                    raise CareError("retention_candidate_changed")
+                destination = retired / source.name
+                if destination.exists():
+                    raise CareError("retention_destination_exists")
+                os.replace(source, destination)
+                moved.append({"from": str(source), "to": str(destination), "sha256": item["sha256"]})
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": all(pathlib.Path(item["to"]).is_file() for item in moved),
+                "moved": moved,
+                "message": "Moved only unchanged planned backups into recoverable retired storage; nothing was deleted.",
+            }
+        else:
+            plan_path = pathlib.Path(args.plan).expanduser().resolve(strict=True)
+            if ROOT / "build" not in plan_path.parents or plan_path.is_symlink():
+                raise CareError("upkeep_plan_path_invalid")
+            if sha256_file(plan_path) != args.sha256.lower():
+                raise CareError("upkeep_plan_hash_mismatch")
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            if plan.get("kind") != "upkeep" or int(plan.get("expiresEpoch", 0)) < int(time.time()):
+                raise CareError("upkeep_plan_expired")
+            database = pathlib.Path(plan["database"]).resolve()
+            if database != (RUNTIME / "automation" / "state.db").resolve():
+                raise CareError("upkeep_database_invalid")
+            if plan.get("databaseSha256") is not None and (
+                not database.is_file() or sha256_file(database) != plan["databaseSha256"]
+            ):
+                raise CareError("upkeep_database_changed")
+            backup = None
+            deleted_cache = 0
+            if database.is_file():
+                backup_root = STATE / "database-backups"
+                backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                backup = backup_root / f"state-{int(time.time())}.db"
+                with sqlite3.connect(database) as source, sqlite3.connect(backup) as destination:
+                    source.backup(destination)
+                    deleted_cache = source.execute(
+                        "DELETE FROM cache WHERE expires_at IS NOT NULL AND expires_at<=?",
+                        (int(plan["createdEpoch"]),),
+                    ).rowcount
+                    source.commit()
+                    source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    source.execute("VACUUM")
+                os.chmod(backup, 0o600)
+                with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        raise CareError("upkeep_database_integrity_failed")
+            retired = STATE / "retired-logs"
+            retired.mkdir(parents=True, exist_ok=True, mode=0o700)
+            moved_logs = []
+            for item in plan.get("logCandidates", []):
+                source = pathlib.Path(item["path"]).resolve(strict=True)
+                if RUNTIME.resolve() not in source.parents or source.is_symlink():
+                    raise CareError("upkeep_log_path_invalid")
+                if sha256_file(source) != item["sha256"]:
+                    raise CareError("upkeep_log_changed")
+                destination = retired / f"{int(time.time())}-{source.name}"
+                if destination.exists():
+                    raise CareError("upkeep_log_destination_exists")
+                os.replace(source, destination)
+                moved_logs.append({"from": str(source), "to": str(destination), "sha256": item["sha256"]})
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "databaseBackup": str(backup) if backup else None,
+                "expiredCacheDeleted": deleted_cache,
+                "retiredLogs": moved_logs,
+                "message": "Backed up and integrity-checked SQLite, pruned only planned expired cache rows, and retired unchanged old logs without deletion.",
+            }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0 if output["taskVerified"] else 2
+    except (CareError, OSError, ValueError, json.JSONDecodeError, sqlite3.Error) as error:
+        print(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "processCompleted": False,
+                    "taskVerified": False,
+                    "error": str(error),
+                    "message": "The care operation stopped without altering live runtime state or claiming unverified recovery.",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

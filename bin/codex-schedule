@@ -1,0 +1,276 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Durable Android JobScheduler integration for verified codex-task files."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time
+
+import yaml
+
+from nemotron_automation import DEFAULT_STATE, atomic_write
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE = DEFAULT_STATE / "schedules"
+JOBS = STATE / "jobs"
+REGISTRY = STATE / "registry.json"
+TASK = ROOT / "bin" / "codex-task"
+SELF = ROOT / "bin" / "codex-schedule"
+JOB_SCHEDULER = os.environ.get("NEMOTRON_JOB_SCHEDULER", "/data/data/com.termux/files/usr/bin/termux-job-scheduler")
+MIN_PERIOD_MS = 900_000
+
+
+class ScheduleError(Exception):
+    pass
+
+
+def load_registry():
+    if not REGISTRY.exists():
+        return {"schemaVersion": 1, "schedules": {}}
+    try:
+        value = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ScheduleError("registry_invalid") from error
+    if value.get("schemaVersion") != 1 or not isinstance(value.get("schedules"), dict):
+        raise ScheduleError("registry_schema")
+    return value
+
+
+def save_registry(value):
+    atomic_write(REGISTRY, (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode())
+
+
+def safe_id(value):
+    if not isinstance(value, str) or not value or len(value) > 80 or not all(character.isalnum() or character in "._-" for character in value):
+        raise ScheduleError("schedule_id_invalid")
+    return value
+
+
+def job_id(schedule_id, registry):
+    candidate = 10_000 + int(hashlib.sha256(schedule_id.encode()).hexdigest()[:8], 16) % 900_000
+    used = {row["jobId"] for key, row in registry["schedules"].items() if key != schedule_id}
+    if candidate in used:
+        raise ScheduleError("job_id_collision")
+    return candidate
+
+
+def parse_time(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as error:
+        raise ScheduleError("at_invalid") from error
+    if parsed.tzinfo is None:
+        raise ScheduleError("at_timezone_required")
+    return int(parsed.timestamp())
+
+
+def scheduler(*arguments, timeout=20):
+    result = subprocess.run(
+        [JOB_SCHEDULER, *arguments], cwd=ROOT, capture_output=True, text=True,
+        timeout=timeout, check=False,
+    )
+    if result.returncode != 0:
+        raise ScheduleError("android_scheduler_failed:" + (result.stderr or result.stdout)[-500:])
+    return result.stdout.strip()
+
+
+def wrapper(schedule_id):
+    return (
+        "#!/data/data/com.termux/files/usr/bin/bash\n"
+        "# managed-by: nemotron-unrestricted codex-schedule schema=1\n"
+        "set -u\n"
+        f"exec {SELF} dispatch {schedule_id}\n"
+    )
+
+
+def register_android(row):
+    arguments = [
+        "--script", row["wrapper"], "--job-id", str(row["jobId"]),
+        "--period-ms", str(row["androidPeriodMs"]),
+        "--network", row["network"],
+        "--battery-not-low", str(row["batteryNotLow"]).lower(),
+        "--storage-not-low", str(row["storageNotLow"]).lower(),
+        "--charging", str(row["charging"]).lower(),
+        "--persisted", str(row["persisted"]).lower(),
+    ]
+    scheduler(*arguments)
+
+
+def task_copy(row, run_epoch):
+    source = pathlib.Path(row["taskFile"])
+    try:
+        payload = yaml.safe_load(source.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as error:
+        raise ScheduleError("task_read_failed") from error
+    payload["id"] = f"{payload['id']}-{row['id']}-{run_epoch}"
+    descriptor, name = tempfile.mkstemp(prefix=f".{row['id']}-", suffix=source.suffix or ".yaml", dir=STATE)
+    path = pathlib.Path(name)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+        yaml.safe_dump(payload, destination, sort_keys=False)
+    os.chmod(path, 0o600)
+    return path
+
+
+def dispatch(schedule_id):
+    registry = load_registry()
+    row = registry["schedules"].get(safe_id(schedule_id))
+    if not row:
+        raise ScheduleError("schedule_missing")
+    if row["status"] != "active":
+        print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": True, "message": "Schedule is not active; no task was dispatched."}))
+        return 0
+    now = int(time.time())
+    due = row["nextRunEpoch"]
+    if now < due:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": True, "message": "Schedule checked before its due time; no task was dispatched.", "nextRunEpoch": due}))
+        return 0
+    if row["missedRunPolicy"] == "skip" and now - due > row["graceSeconds"]:
+        row["lastOutcome"] = "missed-skipped"
+        if row["intervalSeconds"]:
+            while row["nextRunEpoch"] <= now:
+                row["nextRunEpoch"] += row["intervalSeconds"]
+        else:
+            row["status"] = "completed"
+            scheduler("--cancel", str(row["jobId"]))
+        save_registry(registry)
+        print(json.dumps({"schemaVersion": 1, "processCompleted": True, "taskVerified": True, "message": "Missed run was skipped according to the saved policy."}))
+        return 0
+    copy = task_copy(row, now)
+    try:
+        result = subprocess.run([str(TASK), "run", str(copy)], cwd=ROOT, capture_output=True, text=True, timeout=3600, check=False)
+    finally:
+        if copy.exists() and copy.parent == STATE:
+            copy.unlink()
+    row["lastRunEpoch"] = now
+    row["lastOutcome"] = "verified" if result.returncode == 0 else "failed"
+    if row["intervalSeconds"]:
+        while row["nextRunEpoch"] <= now:
+            row["nextRunEpoch"] += row["intervalSeconds"]
+    elif result.returncode == 0:
+        row["status"] = "completed"
+        scheduler("--cancel", str(row["jobId"]))
+    save_registry(registry)
+    print(result.stdout, end="")
+    return result.returncode
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="codex-schedule",
+        description="Create, inspect, pause, resume, cancel, or dispatch verified Android schedules.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create")
+    create.add_argument("id")
+    create.add_argument("--task", required=True)
+    timing = create.add_mutually_exclusive_group(required=True)
+    timing.add_argument("--at")
+    timing.add_argument("--every-seconds", type=int)
+    create.add_argument("--network", choices=("any", "unmetered", "cellular", "not_roaming", "none"), default="any")
+    create.add_argument("--charging", action="store_true")
+    create.add_argument("--allow-low-battery", action="store_true")
+    create.add_argument("--storage-not-low", action="store_true")
+    create.add_argument("--persisted", action="store_true")
+    create.add_argument("--missed-run", choices=("catch-up", "skip"), default="catch-up")
+    create.add_argument("--grace-seconds", type=int, default=3600)
+    commands.add_parser("list")
+    for name in ("pause", "resume", "cancel", "run-now", "status"):
+        child = commands.add_parser(name)
+        child.add_argument("id")
+    dispatch_parser = commands.add_parser("dispatch")
+    dispatch_parser.add_argument("id")
+    args = parser.parse_args()
+    try:
+        if args.command == "dispatch":
+            return dispatch(args.id)
+        registry = load_registry()
+        if args.command == "list":
+            pending = scheduler("--pending")
+            print(json.dumps({"schemaVersion": 1, "action": "List durable schedules", "processCompleted": True, "taskVerified": True, "schedules": list(registry["schedules"].values()), "androidPending": pending}, sort_keys=True))
+            return 0
+        schedule_id = safe_id(args.id)
+        if args.command == "create":
+            if schedule_id in registry["schedules"]:
+                raise ScheduleError("schedule_exists")
+            task_file = pathlib.Path(args.task).resolve(strict=True)
+            validation = subprocess.run([str(TASK), "validate", str(task_file)], cwd=ROOT, capture_output=True, text=True, timeout=30, check=False)
+            if validation.returncode != 0:
+                raise ScheduleError("task_validation_failed")
+            now = int(time.time())
+            if args.every_seconds is not None:
+                if args.every_seconds < 900:
+                    raise ScheduleError("interval_below_android_minimum")
+                interval = args.every_seconds
+                next_run = now + interval
+                android_period = interval * 1000
+            else:
+                interval = None
+                next_run = parse_time(args.at)
+                if next_run <= now:
+                    raise ScheduleError("at_must_be_future")
+                android_period = MIN_PERIOD_MS
+            if not 0 <= args.grace_seconds <= 604_800:
+                raise ScheduleError("grace_invalid")
+            JOBS.mkdir(parents=True, exist_ok=True, mode=0o700)
+            wrapper_path = JOBS / f"{schedule_id}.sh"
+            atomic_write(wrapper_path, wrapper(schedule_id).encode(), 0o700)
+            row = {
+                "id": schedule_id, "jobId": job_id(schedule_id, registry),
+                "taskFile": str(task_file), "wrapper": str(wrapper_path),
+                "status": "active", "createdAtEpoch": now, "nextRunEpoch": next_run,
+                "intervalSeconds": interval, "androidPeriodMs": android_period,
+                "network": args.network, "charging": args.charging,
+                "batteryNotLow": not args.allow_low_battery,
+                "storageNotLow": args.storage_not_low, "persisted": args.persisted,
+                "missedRunPolicy": args.missed_run, "graceSeconds": args.grace_seconds,
+                "lastRunEpoch": None, "lastOutcome": None,
+            }
+            registry["schedules"][schedule_id] = row
+            save_registry(registry)
+            register_android(row)
+            print(json.dumps({"schemaVersion": 1, "action": "Create durable verified schedule", "processCompleted": True, "taskVerified": True, "schedule": row, "message": "Android JobScheduler accepted the exact persisted schedule."}, sort_keys=True))
+            return 0
+        row = registry["schedules"].get(schedule_id)
+        if not row:
+            raise ScheduleError("schedule_missing")
+        if args.command == "status":
+            print(json.dumps({"schemaVersion": 1, "action": "Inspect one schedule", "processCompleted": True, "taskVerified": True, "schedule": row}, sort_keys=True))
+            return 0
+        if args.command == "pause":
+            scheduler("--cancel", str(row["jobId"]))
+            row["status"] = "paused"
+        elif args.command == "resume":
+            row["status"] = "active"
+            register_android(row)
+        elif args.command == "run-now":
+            row["nextRunEpoch"] = int(time.time())
+            save_registry(registry)
+            return dispatch(schedule_id)
+        else:
+            scheduler("--cancel", str(row["jobId"]))
+            wrapper_path = pathlib.Path(row["wrapper"])
+            if wrapper_path.is_file() and not wrapper_path.is_symlink() and wrapper_path.parent == JOBS:
+                wrapper_path.unlink()
+            del registry["schedules"][schedule_id]
+            save_registry(registry)
+            print(json.dumps({"schemaVersion": 1, "action": "Cancel one exact schedule", "processCompleted": True, "taskVerified": True, "cancelled": schedule_id}, sort_keys=True))
+            return 0
+        save_registry(registry)
+        print(json.dumps({"schemaVersion": 1, "action": f"{args.command.title()} one exact schedule", "processCompleted": True, "taskVerified": True, "schedule": row}, sort_keys=True))
+        return 0
+    except (OSError, ScheduleError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({"schemaVersion": 1, "processCompleted": False, "taskVerified": False, "error": str(error), "message": "Scheduling stopped safely before claiming success."}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

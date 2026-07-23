@@ -1,0 +1,10 @@
+<resources>
+    <style name="Theme.NemotronUnrestricted" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/nemotron_icon_background</item>
+        <item name="android:colorPrimary">@color/nemotron_primary</item>
+        <item name="android:colorPrimaryDark">@color/nemotron_secondary</item>
+        <item name="android:colorAccent">@color/nemotron_accent</item>
+        <item name="android:statusBarColor">@color/nemotron_icon_background</item>
+        <item name="android:navigationBarColor">@color/nemotron_icon_background</item>
+    </style>
+</resources>

@@ -1,0 +1,164 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""TTL-bound Android device, app, feature, and readiness registry."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+from nemotron_android_policy import run_rish
+from nemotron_automation import AutomationState
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DOCTOR = os.environ.get("NEMOTRON_DOCTOR_COMMAND", str(ROOT / "bin" / "codex-doctor"))
+TERMUX_BIN = pathlib.Path("/data/data/com.termux/files/usr/bin")
+SAFE_PROPERTY = re.compile(r"^[\w .,+()/:@-]{0,256}$")
+
+
+class DeviceError(Exception):
+    pass
+
+
+def identity_from_properties(values):
+    required = {"manufacturer", "model", "sdk", "securityPatch", "fingerprint"}
+    if set(values) != required or any(not isinstance(value, str) or not SAFE_PROPERTY.fullmatch(value) for value in values.values()):
+        raise DeviceError("device_identity_invalid")
+    if not values["manufacturer"] or not values["model"] or not values["sdk"] or not values["fingerprint"]:
+        raise DeviceError("device_identity_incomplete")
+    try:
+        sdk = int(values["sdk"])
+    except ValueError as error:
+        raise DeviceError("device_sdk_invalid") from error
+    return {
+        "manufacturer": values["manufacturer"], "model": values["model"], "sdk": sdk,
+        "securityPatch": values["securityPatch"],
+        "fingerprintSha256": hashlib.sha256(values["fingerprint"].encode()).hexdigest(),
+    }
+
+
+def parse_lines(text, prefix):
+    values = sorted({
+        line[len(prefix):].strip() for line in text.splitlines()
+        if line.startswith(prefix) and line[len(prefix):].strip()
+    })
+    if len(values) > 10_000:
+        raise DeviceError("device_inventory_limit")
+    return values
+
+
+def doctor_receipt():
+    completed = subprocess.run([DOCTOR, "android", "--json"], cwd=ROOT, capture_output=True, text=True, timeout=90, check=False)
+    if completed.returncode != 0:
+        raise DeviceError("device_readiness_failed")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise DeviceError("device_readiness_receipt_invalid") from error
+    if value.get("taskVerified") is not True:
+        raise DeviceError("device_readiness_unverified")
+    android = value.get("android") or {}
+    return {
+        "shizukuVerified": (android.get("shizuku") or {}).get("verified") is True,
+        "storageMappingsVerified": bool(android.get("storageMappingsVerified")),
+        "termuxBatteryExempt": ((android.get("batteryOptimization") or {}).get("termuxExempt")),
+        "nemotronBatteryExempt": ((android.get("batteryOptimization") or {}).get("nemotronExempt")),
+        "nemotronPackageVerified": (((android.get("packages") or {}).get("nemotron") or {}).get("verified") is True),
+    }
+
+
+def live_inventory():
+    properties = {}
+    for name, key, required in (
+        ("manufacturer", "ro.product.manufacturer", True), ("model", "ro.product.model", True),
+        ("sdk", "ro.build.version.sdk", True), ("securityPatch", "ro.build.version.security_patch", False),
+        ("fingerprint", "ro.build.fingerprint", True),
+    ):
+        value = ""
+        for _attempt in range(3):
+            value = run_rish("/system/bin/getprop " + key).stdout.strip()
+            if value or not required:
+                break
+        properties[name] = value
+    identity = identity_from_properties(properties)
+    packages = parse_lines(run_rish("pm list packages --user 0").stdout, "package:")
+    features = parse_lines(run_rish("pm list features").stdout, "feature:")
+    api_commands = sorted(
+        path.name for path in TERMUX_BIN.glob("termux-*")
+        if path.is_file() and os.access(path, os.X_OK)
+    )
+    readiness = doctor_receipt()
+    return identity, packages, features, api_commands, readiness
+
+
+def refresh():
+    state = AutomationState()
+    identity, packages, features, api_commands, readiness = live_inventory()
+    previous = state.cache_get("device_registry", "identity")
+    changed = bool(previous and previous["value"].get("fingerprintSha256") != identity["fingerprintSha256"])
+    if changed:
+        for key in ("packages", "features", "api_commands", "readiness"):
+            state.cache_delete("device_registry", key)
+    state.cache_set("device_registry", "identity", identity, 86_400)
+    state.cache_set("device_registry", "packages", packages, 43_200)
+    state.cache_set("device_registry", "features", features, 86_400)
+    state.cache_set("device_registry", "api_commands", api_commands, 3600)
+    state.cache_set("device_registry", "readiness", readiness, 3600)
+    state.increment("device_registry_refresh")
+    return {
+        "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+        "identity": identity, "identityChanged": changed,
+        "packageCount": len(packages), "featureCount": len(features), "termuxApiCommandCount": len(api_commands),
+        "readiness": readiness,
+        "freshnessSeconds": {"identity": 86_400, "packages": 43_200, "features": 86_400, "api_commands": 3600, "readiness": 3600},
+        "message": "Refreshed the safe Android identity, app, feature, Termux API, and readiness registry.",
+    }
+
+
+def status(fragment=None):
+    state = AutomationState()
+    values = {}
+    for key in ("identity", "packages", "features", "api_commands", "readiness"):
+        cached = state.cache_get("device_registry", key)
+        values[key] = {
+            "present": cached is not None, "ageSeconds": cached.get("ageSeconds") if cached else None,
+            "expiresAtEpoch": cached.get("expiresAtEpoch") if cached else None,
+            "value": cached.get("value") if cached else None,
+        }
+    verified = all(item["present"] for item in values.values())
+    matches = []
+    if fragment and values["packages"]["value"]:
+        matches = [item for item in values["packages"]["value"] if fragment.casefold() in item.casefold()]
+    return {
+        "schemaVersion": 1, "processCompleted": True, "taskVerified": verified,
+        "registry": values, "packageMatches": matches,
+        "message": "The Android device registry is fresh." if verified else "One or more Android registry records are absent or expired.",
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Refresh, inspect, or search the safe Android device registry.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("refresh")
+    commands.add_parser("status")
+    search = commands.add_parser("search")
+    search.add_argument("fragment")
+    args = parser.parse_args()
+    try:
+        value = refresh() if args.command == "refresh" else status(args.fragment if args.command == "search" else None)
+        print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+        return 0 if value["taskVerified"] else 4
+    except (DeviceError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
+            "error": str(error), "message": "Device registry refresh stopped without persisting unverified identity or readiness.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
