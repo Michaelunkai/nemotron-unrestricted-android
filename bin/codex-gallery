@@ -267,9 +267,9 @@ def detect_face_batches(paths, remote_jar, batch_size=8):
     for start in range(0, len(paths), batch_size):
         batch = paths[start:start + batch_size]
         progress(f"checking images {start + 1}–{start + len(batch)} of {len(paths)} for visible faces.")
-        pending = [batch]
+        pending = [(batch, 0)]
         while pending:
-            attempt = pending.pop(0)
+            attempt, retry_number = pending.pop(0)
             command = (
                 f"CLASSPATH={shlex.quote(remote_jar)} app_process /system/bin "
                 "com.michaelovsky.nemotronunrestricted.tools.NemotronFaceDetector "
@@ -290,7 +290,14 @@ def detect_face_batches(paths, remote_jar, batch_size=8):
                 continue
             if len(attempt) > 1:
                 progress(f"the detector omitted {len(missing)} image receipt(s); retrying those images individually.")
-                pending[0:0] = [[path] for path in missing]
+                pending[0:0] = [([path], 1) for path in missing]
+                continue
+            if retry_number < 3:
+                progress(
+                    f"the detector omitted the individual receipt on attempt {retry_number}; "
+                    "retrying that exact image."
+                )
+                pending.insert(0, (attempt, retry_number + 1))
                 continue
             path = attempt[0]
             by_path[path] = {

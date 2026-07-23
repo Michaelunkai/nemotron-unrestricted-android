@@ -135,6 +135,20 @@ class GalleryTests(unittest.TestCase):
         self.assertEqual(len(run.call_args_list), 2)
         self.assertEqual(result[paths[1]]["faceCount"], 1)
 
+    def test_face_detector_retries_transient_individual_omissions_three_times(self):
+        path = "/storage/emulated/0/Download/transient.png"
+        omitted = types.SimpleNamespace(remote_status=0, stdout="")
+        recovered = types.SimpleNamespace(
+            remote_status=0, stdout=json.dumps({"path": path, "faceCount": 1}),
+        )
+        with mock.patch.object(
+            GALLERY, "run_rish", side_effect=[omitted, omitted, omitted, recovered],
+        ) as run:
+            result = GALLERY.detect_face_batches([path], "/data/local/tmp/detector.jar")
+        self.assertEqual(len(run.call_args_list), 4)
+        self.assertEqual(result[path]["faceCount"], 1)
+        self.assertNotIn("error", result[path])
+
     def test_detector_staging_retries_until_exact_remote_hash(self):
         temporary = pathlib.Path(tempfile.mkdtemp(prefix="gallery-detector-", dir=ROOT / "workspace"))
         try:
