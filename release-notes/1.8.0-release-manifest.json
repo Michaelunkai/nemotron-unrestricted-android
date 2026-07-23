@@ -11,7 +11,7 @@
     "signatureSchemes": ["v1", "v2", "v3"]
   },
   "verification": {
-    "automatedTests": 370,
+    "automatedTests": 374,
     "exactProductionPathTestsExcludedInIsolatedWorktree": 2,
     "sourceValidation": true,
     "secretScan": true,
@@ -24,6 +24,9 @@
     "permissionReadinessTests": true,
     "polyglotScaffoldTests": true,
     "deploymentPreflightTests": true,
+    "galleryDetectorRetryTests": true,
+    "boundedUiSnapshotTransportTests": true,
+    "semanticUiObjectRankingTests": true,
     "publicAssetReadback": "pending",
     "installedBytesMatch": "pending",
     "preservationVerified": "pending",
