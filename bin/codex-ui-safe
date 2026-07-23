@@ -35,6 +35,8 @@ SEMANTIC_EQUIVALENTS = (
     {"edit", "change", "modify"},
     {"login", "signin", "sign", "account"},
 )
+UI_STAGE_ROOT = pathlib.Path("/storage/emulated/0/Download/.nemotron-tools/ui-snapshots")
+MAX_UI_SNAPSHOT_BYTES = 4 * 1024 * 1024
 
 
 class UiError(Exception):
@@ -71,16 +73,31 @@ def snapshot(package):
     if current_package() != package:
         raise UiError("foreground_package_mismatch")
     remote = f"/data/local/tmp/nemotron-ui-{uuid.uuid4().hex}.xml"
+    UI_STAGE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    local = UI_STAGE_ROOT / f"nemotron-ui-{uuid.uuid4().hex}.xml"
     command = (
         f"uiautomator dump {shlex.quote(remote)} >/dev/null && "
-        f"cat {shlex.quote(remote)}; __ui_status=$?; rm -f {shlex.quote(remote)}; exit $__ui_status"
+        f"cp {shlex.quote(remote)} {shlex.quote(str(local))} && "
+        f"chmod 600 {shlex.quote(str(local))}; __ui_status=$?; "
+        f"rm -f {shlex.quote(remote)}; exit $__ui_status"
     )
-    result = read_rish(command)
     try:
-        root = ET.fromstring(result.stdout)
+        read_rish(command)
+        if (
+            not local.is_file()
+            or local.is_symlink()
+            or not 1 <= local.stat().st_size <= MAX_UI_SNAPSHOT_BYTES
+        ):
+            raise UiError("ui_snapshot_invalid")
+        source = local.read_text(encoding="utf-8")
+        root = ET.fromstring(source)
     except ET.ParseError as error:
         raise UiError("ui_snapshot_invalid") from error
-    return root, result.stdout
+    finally:
+        local.unlink(missing_ok=True)
+    if current_package() != package:
+        raise UiError("foreground_package_changed")
+    return root, source
 
 
 def selector(value):

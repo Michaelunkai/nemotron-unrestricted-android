@@ -101,7 +101,10 @@ class UiSafeTests(unittest.TestCase):
             if command == "dumpsys activity activities":
                 return Result("topResumedActivity=ActivityRecord{} u0 com.example/.Main}")
             if command.startswith("uiautomator dump"):
-                return Result(next(snapshots))
+                match = MODULE["re"].search(r"cp\s+\S+\s+(\S+)\s+&&", command)
+                self.assertIsNotNone(match)
+                pathlib.Path(match.group(1)).write_text(next(snapshots), encoding="utf-8")
+                return Result()
             if command.startswith("input tap"):
                 return Result()
             raise AssertionError(command)
@@ -114,6 +117,7 @@ class UiSafeTests(unittest.TestCase):
             }]), encoding="utf-8")
             output = io.StringIO()
             with mock.patch.object(sys, "argv", ["codex-ui-safe", "run", "--package", "com.example", "--spec", str(spec)]), \
+                 mock.patch.dict(MODULE["snapshot"].__globals__, {"UI_STAGE_ROOT": pathlib.Path(temp)}), \
                  mock.patch.dict(MODULE["main"].__globals__, {"run_rish": fake_rish}), \
                  contextlib.redirect_stdout(output):
                 self.assertEqual(MODULE["main"](), 0)
