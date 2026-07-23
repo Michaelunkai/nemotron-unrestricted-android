@@ -1,7 +1,263 @@
 # Nemotron Unrestricted — authoritative next-session handoff
 
 Updated: 2026-07-23 UTC
-Status: v1.7.0/code 8 implementation, deterministic signed build, protected-state upgrade rehearsal, private Android verification, and real inline gallery-image delivery are complete. The final publication, public-download readback, and final in-place reinstall are the only remaining release operations at this checkpoint.
+Status: v1.8.0/code 9 is implemented, tested, installed in place, live-verified, and published with a downloadable signed APK. There is no unfinished release mission.
+
+## Authoritative v1.8.0 checkpoint
+
+This section supersedes every older version, hash, test count, installed-state,
+publication, and remaining-work statement below wherever they conflict. Older
+sections are retained only for architecture, recovery recipes, and historical
+failure lessons.
+
+### Exact identity
+
+- Production root:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app`
+- Secret-clean release worktree:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app-v1.7`
+  (the directory name is historical; its release content is v1.8.0).
+- Clean branch: `agent/inline-gallery-images-v1.7`
+- Public repository:
+  `https://github.com/Michaelunkai/nemotron-unrestricted-android`
+- Public release branch: `release/v1.8.0-clean`
+- Public release/tag: `v1.8.0`
+- Release page:
+  `https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/tag/v1.8.0`
+- Direct APK:
+  `https://github.com/Michaelunkai/nemotron-unrestricted-android/releases/download/v1.8.0/Nemotron-Unrestricted-1.8.0.apk`
+- Android package:
+  `com.michaelovsky.nemotronunrestricted.isolated`
+- Activity/service: `.MainActivity` / `.NemotronRuntimeService`
+- Android versionName/versionCode: `1.8.0` / `9`
+- Signed APK in both roots:
+  `dist/Nemotron-Unrestricted-1.8.0.apk`
+- APK bytes: `296498`
+- APK SHA-256:
+  `7677469155c588b8b5a474dc57e8e9d4dedf93b895749256bbe35d2f277722bf`
+- Signing certificate SHA-256:
+  `f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f`
+- Verified Android signature schemes: v1, v2, and v3.
+- `.idsig` SHA-256:
+  `86b7cab4afd92b2fca980b769411546e9a589cead0e4f49cdc80dbf42984179b`
+- `.sha256` file SHA-256:
+  `b797ede4d4aebeb9568f20766f06083f0193f6abde620b246f90cb86cbbb38c0`
+- APK release receipt SHA-256:
+  `1b7419e0e3e2c33f82d637f96b3b8bd1d01abedcff6fdaabddbb748b2fb0efb2`
+- The annotated public tag resolves to the handoff-inclusive descendant of the
+  implementation commits below. Resolve its final identifier live with
+  `git rev-parse v1.8.0^{commit}`; do not try to embed a commit identifier in
+  the file that is itself part of that commit.
+
+### v1.8 implementation commits and capabilities
+
+The v1.8 implementation begins at `e7e7b57` on top of the clean public v1.7
+lineage. Important commits include:
+
+- `e7e7b57`: factual progress heartbeat, travel, semantic UI, permission
+  readiness, deployment preflight, and polyglot release content.
+- `a173bc0` and `ad12cd8`: exact-hash detector staging retries and three
+  bounded individual receipt retries.
+- `2ede3bf`, `77e6df9`, `242d185`, and `2be7170`: bounded read-only UI retry,
+  temporary shared snapshot transport, bounded foreground readback, and the
+  completion-marker exit fix.
+- `1a1c22b` and `a3eb984`: visible labels and object terms outrank generic
+  widget/resource “view” matches.
+- `497d154`: release acceptance documentation before the final handoff.
+
+Delivered behavior:
+
+- Supervisor version 4 emits a factual, turn-scoped English heartbeat no more
+  than 105 seconds apart while a turn is active. It derives text from that
+  exact turn's next action or last verified progress; it does not generate
+  generic timer text or expose raw commands as the primary status.
+- `codex-trip create|verify` creates a confined, hash-verified trip pack with
+  `trip.json`, `itinerary.md`, `trip.ics`, `research.json`, `actions.json`,
+  bounded current web research, and an encoded Google Maps handoff.
+- `codex-intent map-search|directions|calendar-event` uses resolve-before-run
+  Android intents, URL encoding, typed calendar insert fields, waypoints,
+  route modes, and navigation.
+- `codex-ui-safe suggest` ranks a fresh package-scoped native hierarchy using
+  visible text, descriptions, and resource IDs; omits password nodes; refuses
+  close ties; stages large dumps through one bounded temporary file; deletes
+  it after parsing; checks the foreground again; and never turns a suggestion
+  into a mutation without an exact selector and postcondition.
+- `codex-device permissions` reports actual Android grants separately from
+  hardware, Termux:API, Shizuku, account, foreground, or consent gates.
+- `codex-gallery faces|semantic` retains the strict
+  `nemotron.gallery-result.v1` contract, MediaStore-bound real-image receipts,
+  pagination through `hasMore:false`, automatic same-session previews,
+  tap-to-open full-size viewing, contact sheets, generated-image rendering,
+  detector stage hash verification, and transient receipt recovery.
+- `codex-scaffold`, `codex-toolchain`, and `codex-pipeline` now cover twelve
+  templates, including C17, C++17, dependency-free Node full-stack, and PWA
+  alongside Python, Go, Rust, Java, Kotlin, Node, web, and Android.
+- `codex-deploy status|plan|run` supports already-authenticated Vercel,
+  Cloudflare Pages, and Netlify CLIs with an exact workspace tree hash,
+  fixed noninteractive commands, receipt hashes, and HTTPS readback.
+- Every selectable model receives the same capability contract. An active
+  model or effort change persists the exact new selection and interrupts the
+  exact active turn once; it does not wait, replay tools/approvals, or silently
+  continue under the old selection.
+- Sticky foreground execution, boot/package-replacement recovery, scoped wake
+  locking, PC/network routing, completion tone, native generated images, and
+  the established protected-package/file boundaries remain intact.
+
+### Research basis and truthful boundaries
+
+The release research used current primary Android intent/accessibility,
+Google Maps URLs, GTFS, Open-Meteo, GitHub, Vercel, Cloudflare, and Netlify
+documentation. Implemented behavior follows these facts:
+
+- Accessibility/UI nodes are snapshots and can become stale; always refresh
+  the package/hierarchy and verify the postcondition.
+- Google Maps URLs require `api=1` and encoded parameters but no Maps API key.
+- Trip sources, prices, schedules, entry rules, weather, and free-tier terms
+  are current-state data and must be rechecked for each trip.
+- A deployment provider can be automated only after its CLI/account is
+  authenticated. At release acceptance, Vercel, Cloudflare, and Netlify CLIs
+  were not installed/authenticated, so status truthfully returned no ready
+  provider instead of opening an account or inventing credentials.
+
+No app can truthfully bypass Android secure surfaces, device locks, logins,
+MFA, CAPTCHAs, payment confirmation, legal consent, provider policy, missing
+hardware, an offline remote PC, or absent credentials. Local runtime,
+checkpoints, and foreground-service work continue without Wi-Fi; a task that
+intrinsically needs the Internet or PC cannot complete while that dependency
+is unreachable and must durably resume when it returns.
+
+The image boundary is deliberate. The app can find and render face presence
+and non-sensitive visible content. It must not infer identity, gender,
+ethnicity, health, religion, or another sensitive attribute from appearance.
+Thus a request phrased as “find women” is safely translated to face-presence
+results or a non-sensitive visible-detail query, not a gender classifier.
+
+### Automated and live acceptance
+
+- `374` path-independent automated tests passed. The two exact-root tests
+  `test_project_local_runtime_capability_delegates` and
+  `test_powershell_and_codex_win_safe_routes_are_mocked` then passed from the
+  production root: total maintained acceptance `376`.
+- Source validation passed `111` Python files, `37` shell files, `3`
+  JavaScript bundles, four 945×2048 off-device UI goldens, the progress
+  overlay harness, and the executable gallery frontend harness.
+- Current-tree and signed-APK secret scans passed.
+- Multiple consecutive signed builds were byte-identical with the APK hash
+  above; the final rebuild after live fixes retained the same hash.
+- Live permission readback verified all Nemotron declared permissions granted.
+  Termux media/calendar/contact/location/phone/SMS grants remain accurately
+  reported as missing where Android has not granted them; Shizuku-backed
+  MediaStore and typed routes continue to work without pretending those
+  Termux grants exist.
+- Live trip proof performed two current source searches with exact English
+  progress and created/verified all five artifacts. Receipt:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/automation/trips/b022bfc298e94c5c8372b23704c373d8.json`.
+  Pack:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/workspace/trips/v18-live-travel-capability-proof-2194cbc3-e9369fda`.
+- Live semantic UI proof opened exact package `com.android.settings` and
+  returned exactly one candidate for “open connections”: visible text
+  `Connections`, center `[339,1271]`, snapshot SHA-256
+  `0d58f5d2ea81a614785042c93499192c77bf2f0f40445852a9b96e6189ab8f08`.
+- Live gallery proof scanned offset 16 through 24, recovered every detector
+  receipt, returned one real face-presence image, produced one verified
+  contact sheet, and set the entire envelope `verified=true`.
+- The original image fetched through GUI `/codex-local-image` had exact source
+  and route SHA-256
+  `c22d27c5a0126dbf9b5532ab4293659afd5a199d852ad061ea6a9b7c5442b220`.
+- Live PC status verified the authenticated, elevated Windows gateway and
+  exact receipt. Live route diagnostics verified an Android default route
+  through sanitized ConnectivityService evidence. Treat addresses/ports as
+  private and dynamic; rediscover through the typed wrappers.
+- The completion profile remains `nemotron-six-note-v1`: exactly `3000` ms,
+  48000 Hz, application-relative volume `0.5`. Supervisor completion sequence
+  and notification acknowledgement were both `4` before the final install.
+- The final private WebView proof returned `ready=true`, one bundle execution,
+  the lazy route, settings/cleanup UI, zero floating controls, zero errors,
+  zero console errors, `privateVirtualDisplay=true`, and
+  `physicalDisplay=false`.
+
+### Final in-place installation and preservation
+
+- Final install completed at Android `lastUpdateTime=2026-07-23 23:34:40`.
+- It streamed exactly `296498` bytes through
+  `pm install --user 0 -r -S 296498` and returned `Success`.
+- No uninstall, `pm clear`, downgrade, visible installer, or package-data
+  reset was used.
+- Installed version readback: `1.8.0`, code `9`.
+- Installed base APK SHA-256 exactly equals the source/public value:
+  `7677469155c588b8b5a474dc57e8e9d4dedf93b895749256bbe35d2f277722bf`.
+- The installed v1.7 signer was independently copied to one temporary,
+  deleted-after-use proof file and matched the candidate signer before
+  mutation. Package Manager also enforced signer continuity.
+- Original `firstInstallTime=2026-07-20 00:36:04` is unchanged.
+- Camera, microphone, and notification runtime grants remain granted.
+- Foreground service readback: `isForeground=true`,
+  `startRequested=true`, `stopIfKilled=false`; the package is on the
+  device-idle whitelist.
+- Final preservation manifest:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/build/release-evidence/preservation-before-v1.8.0-final-install.sha256`.
+- Pre-sync backup and baseline:
+  `/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/v18-production-sync-backup`.
+- Both pre-sync and immediate pre-install verification matched five session
+  files, five JSONL files, five unique thread IDs, thread fingerprint
+  `8f8c4f95071f933044a6ac3d`, five project roots, project fingerprint
+  `891ccfa1ced7653d2bd73919`, readable SQLite, and zero parse errors.
+
+### Runtime checkpoint
+
+Always source, never hard-code:
+
+`/data/data/com.termux/files/home/nemotron-unrestricted-app/runtime/.codex/supervisor/ports.env`
+
+At final acceptance it reported GUI `5903`, proxy `18774`, and supervisor
+`18775`. Supervisor health: version `4`, `activeTurnCount=0`, completion and
+acknowledgement sequence `4`. Proxy health: app identity correct, credential
+configured, default model `nousresearch/hermes-4-405b`, exact paired-PC
+Dolphin available, model substitution false, all-model contract active, and
+English progress required. Re-read ports and health for every future claim.
+
+### Publication and public readback
+
+Public `main`, `release/v1.8.0-clean`, and annotated tag `v1.8.0` contain the
+secret-clean handoff-complete release. The GitHub release assets are:
+
+- `Nemotron-Unrestricted-1.8.0.apk`
+- `Nemotron-Unrestricted-1.8.0.apk.sha256`
+- `Nemotron-Unrestricted-1.8.0.apk.idsig`
+- `Nemotron-Unrestricted-1.8.0.apk.release.json`
+- `1.8.0-release-manifest.json`
+- `nemotron-unrestricted-android-v1.8.0-source.tar.gz`
+
+Independent public readback verified the refs, raw README, raw handoff,
+release asset names/sizes, and downloaded APK SHA/package/version/signer.
+The public tree excludes runtime credentials, signing material, sessions,
+databases, logs, gallery/trip user outputs, private gateway configuration,
+and legacy private ancestry. GitHub release immutability is not claimed;
+authenticity is provided by the Android signing certificate, published hash,
+release metadata, and independent readback.
+
+### Continuation contract
+
+There is no remaining v1.8 mission. A future session must read this section,
+preserve the installed/runtime state, and immediately perform the user's new
+request on top of this baseline. Do not repeat the research, rebuild/reinstall
+without a relevant source change, replay completed turns, or redownload the
+85 GB paired-PC model.
+
+Use the project-local Android wrapper for its documented
+`open|current|dump|tap|swipe|text|key` actions. The global launcher
+`codex-android` version 1.5.0 rejects those newer action names, so do not
+confuse that alias with `bin/codex-android`. `nemotron-unrestricted-start.sh`
+has no help-only mode; passing `--help` performs its idempotent startup.
+
+Preserve the exact safety and evidence rules: one active visible plan step,
+specific English progress based on observed events, bounded alternate
+strategies, exact postcondition readback, no broad deletion, no uninstall or
+data clear, no secret output, and no claim that a command row alone completed
+the task.
+
+Historical v1.7 checkpoint follows. Its remaining-work statement is obsolete
+and retained only as release history.
 
 ## Authoritative v1.7.0 checkpoint
 

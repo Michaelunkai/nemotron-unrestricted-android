@@ -27,12 +27,12 @@
     "galleryDetectorRetryTests": true,
     "boundedUiSnapshotTransportTests": true,
     "semanticUiObjectRankingTests": true,
-    "publicAssetReadback": "pending",
-    "installedBytesMatch": "pending",
-    "preservationVerified": "pending",
-    "privateAndroidWebViewProof": "pending",
-    "liveGalleryImagesDelivered": "pending",
-    "foregroundServiceVerified": "pending",
+    "publicAssetReadback": true,
+    "installedBytesMatch": true,
+    "preservationVerified": true,
+    "privateAndroidWebViewProof": true,
+    "liveGalleryImagesDelivered": 1,
+    "foregroundServiceVerified": true,
     "physicalForegroundUsed": false
   }
 }
