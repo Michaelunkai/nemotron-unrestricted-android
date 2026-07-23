@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "release": "v1.8.0",
+  "androidVersionCode": 9,
+  "package": "com.michaelovsky.nemotronunrestricted.isolated",
+  "asset": {
+    "name": "Nemotron-Unrestricted-1.8.0.apk",
+    "bytes": 296498,
+    "sha256": "7677469155c588b8b5a474dc57e8e9d4dedf93b895749256bbe35d2f277722bf",
+    "signerSha256": "f9eddd82a7fe4e0ce902f956e35f29dbaea2b7cd97f33f29fa323945a7df528f",
+    "signatureSchemes": ["v1", "v2", "v3"]
+  },
+  "verification": {
+    "automatedTests": 370,
+    "exactProductionPathTestsExcludedInIsolatedWorktree": 2,
+    "sourceValidation": true,
+    "secretScan": true,
+    "reproducibleBuild": true,
+    "automaticGalleryRenderingHarness": true,
+    "generatedImageViewPreserved": true,
+    "factualHeartbeatTests": true,
+    "travelPackTests": true,
+    "semanticUiTests": true,
+    "permissionReadinessTests": true,
+    "polyglotScaffoldTests": true,
+    "deploymentPreflightTests": true,
+    "publicAssetReadback": "pending",
+    "installedBytesMatch": "pending",
+    "preservationVerified": "pending",
+    "privateAndroidWebViewProof": "pending",
+    "liveGalleryImagesDelivered": "pending",
+    "foregroundServiceVerified": "pending",
+    "physicalForegroundUsed": false
+  }
+}

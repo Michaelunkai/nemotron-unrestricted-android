@@ -10,6 +10,7 @@ import re
 import shlex
 import sys
 import time
+import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -18,7 +19,22 @@ from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_
 
 BOUNDS = re.compile(r"^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$")
 COMPONENT = re.compile(r"(?:topResumedActivity=.*?|mResumedActivity:.*?)\bu\d+\s+([^\s}]+/[^\s}]+)")
-ALLOWED_SELECTOR_FIELDS = {"text", "textContains", "resourceId", "contentDescription", "className", "clickable", "enabled"}
+ALLOWED_SELECTOR_FIELDS = {
+    "text", "textContains", "resourceId", "contentDescription", "className",
+    "clickable", "enabled", "semanticText",
+}
+SEMANTIC_EQUIVALENTS = (
+    {"save", "done", "finish", "apply", "confirm"},
+    {"continue", "next", "proceed", "forward"},
+    {"submit", "send", "post", "publish"},
+    {"book", "reserve", "reservation"},
+    {"search", "find", "lookup"},
+    {"close", "dismiss", "cancel"},
+    {"open", "view", "show"},
+    {"delete", "remove", "trash"},
+    {"edit", "change", "modify"},
+    {"login", "signin", "sign", "account"},
+)
 
 
 class UiError(Exception):
@@ -61,12 +77,65 @@ def selector(value):
     return result
 
 
+def normalized(value):
+    folded = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return " ".join(re.findall(r"[a-z0-9]+", folded))
+
+
+def semantic_terms(value):
+    terms = set(normalized(value).split())
+    expanded = set(terms)
+    for group in SEMANTIC_EQUIVALENTS:
+        if terms & group:
+            expanded.update(group)
+    return terms, expanded
+
+
+def semantic_score(node, query):
+    original, expanded = semantic_terms(query)
+    if not original:
+        return 0
+    fields = (
+        node.attrib.get("text", ""),
+        node.attrib.get("content-desc", ""),
+        node.attrib.get("resource-id", "").replace("_", " ").replace("-", " "),
+        node.attrib.get("class", "").rsplit(".", 1)[-1],
+    )
+    haystack = normalized(" ".join(fields))
+    haystack_terms = set(haystack.split())
+    matches = sum(
+        1 for term in original
+        if term in haystack_terms
+        or any(candidate in haystack_terms for candidate in expanded if candidate == term or candidate in next(
+            (group for group in SEMANTIC_EQUIVALENTS if term in group), {term}
+        ))
+    )
+    if matches == 0:
+        return 0
+    score = int(70 * matches / len(original))
+    if any(
+        term in group and any(candidate in haystack_terms for candidate in group)
+        for term in original for group in SEMANTIC_EQUIVALENTS
+    ):
+        score += 20
+    phrase = normalized(query)
+    if phrase and phrase in haystack:
+        score += 20
+    if node.attrib.get("clickable") == "true":
+        score += 5
+    if node.attrib.get("enabled") == "true":
+        score += 5
+    return min(score, 100)
+
+
 def matches(node, wanted):
     mapping = {
         "text": "text", "resourceId": "resource-id", "contentDescription": "content-desc",
         "className": "class", "clickable": "clickable", "enabled": "enabled",
     }
     for key, value in wanted.items():
+        if key == "semanticText":
+            continue
         if key == "textContains":
             if value not in node.attrib.get("text", ""):
                 return False
@@ -80,11 +149,54 @@ def matches(node, wanted):
 
 def find(root, wanted):
     values = [node for node in root.iter("node") if matches(node, wanted)]
+    if "semanticText" in wanted:
+        ranked = sorted(
+            ((semantic_score(node, wanted["semanticText"]), node) for node in values),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        ranked = [pair for pair in ranked if pair[0] >= 60]
+        if not ranked:
+            raise UiError("semantic_selector_not_found")
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 10:
+            raise UiError("semantic_selector_ambiguous")
+        return ranked[0][1]
     if not values:
         raise UiError("selector_not_found")
     if len(values) > 1:
         raise UiError("selector_ambiguous")
     return values[0]
+
+
+def semantic_suggestions(root, goal, limit):
+    if not isinstance(goal, str) or not goal or len(goal) > 512 or any(ord(char) < 32 for char in goal):
+        raise UiError("semantic_goal_invalid")
+    ranked = []
+    for node in root.iter("node"):
+        if node.attrib.get("password") == "true" or node.attrib.get("enabled") == "false":
+            continue
+        try:
+            coordinates = center(node)
+        except UiError:
+            continue
+        score = semantic_score(node, goal)
+        if score < 35:
+            continue
+        ranked.append((score, node, coordinates))
+    ranked.sort(key=lambda item: (-item[0], item[2][1], item[2][0]))
+    return [{
+        "score": score,
+        "text": bounded_node_text(node.attrib.get("text")),
+        "contentDescription": bounded_node_text(node.attrib.get("content-desc")),
+        "resourceId": bounded_node_text(node.attrib.get("resource-id")),
+        "className": bounded_node_text(node.attrib.get("class")),
+        "clickable": node.attrib.get("clickable") == "true",
+        "center": list(coordinates),
+    } for score, node, coordinates in ranked[:limit]]
+
+
+def bounded_node_text(value):
+    return str(value or "")[:256]
 
 
 def center(node):
@@ -193,6 +305,10 @@ def main():
     inspect = commands.add_parser("snapshot")
     inspect.add_argument("--package", required=True)
     inspect.add_argument("--selector")
+    suggest = commands.add_parser("suggest")
+    suggest.add_argument("--package", required=True)
+    suggest.add_argument("--goal", required=True)
+    suggest.add_argument("--limit", type=int, default=8)
     run = commands.add_parser("run")
     run.add_argument("--package", required=True)
     run.add_argument("--spec", required=True)
@@ -200,17 +316,32 @@ def main():
     args = parser.parse_args()
     try:
         package = validate_package_id(args.package)
-        if args.command == "snapshot":
+        if args.command in {"snapshot", "suggest"}:
             root, source = snapshot(package)
-            wanted = selector(json.loads(args.selector)) if args.selector else None
-            node = find(root, wanted) if wanted else None
-            output = {
-                "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
-                "package": package, "nodeCount": sum(1 for _ in root.iter("node")),
-                "selectorMatched": bool(node) if wanted else None,
-                "snapshotSha256": hashlib.sha256(source.encode()).hexdigest(),
-                "message": "Captured and hashed the package-scoped UI hierarchy without changing the screen.",
-            }
+            if args.command == "snapshot":
+                wanted = selector(json.loads(args.selector)) if args.selector else None
+                node = find(root, wanted) if wanted else None
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "package": package, "nodeCount": sum(1 for _ in root.iter("node")),
+                    "selectorMatched": bool(node) if wanted else None,
+                    "snapshotSha256": hashlib.sha256(source.encode()).hexdigest(),
+                    "message": "Captured and hashed the package-scoped UI hierarchy without changing the screen.",
+                }
+            else:
+                if not 1 <= args.limit <= 20:
+                    raise UiError("semantic_limit_invalid")
+                suggestions = semantic_suggestions(root, args.goal, args.limit)
+                output = {
+                    "schemaVersion": 1, "processCompleted": True, "taskVerified": True,
+                    "package": package, "goal": args.goal, "candidates": suggestions,
+                    "candidateCount": len(suggestions),
+                    "snapshotSha256": hashlib.sha256(source.encode()).hexdigest(),
+                    "message": (
+                        "Ranked fresh non-password UI targets for the requested action without "
+                        "clicking; use an exact unique selector and verify the next screen."
+                    ),
+                }
         else:
             steps = validate_spec(json.loads(pathlib.Path(args.spec).read_text(encoding="utf-8")))
             events = []

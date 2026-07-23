@@ -17,8 +17,9 @@ from urllib.request import Request, urlopen
 
 
 APP_ID = "nemotron-unrestricted"
-VERSION = "3"
+VERSION = "4"
 MAX_EVENT_BYTES = 64 * 1024
+PROGRESS_HEARTBEAT_SECONDS = 105
 
 
 def configured_port(name, default):
@@ -42,6 +43,9 @@ PROGRESS_SEQUENCE = 0
 SEEN_COMPLETIONS = {}
 SEEN_PROGRESS_EVENTS = {}
 TURN_PROGRESS_SEQUENCES = {}
+LAST_PROGRESS_BY_TURN = {}
+LAST_PROGRESS_MONOTONIC = {}
+HEARTBEAT_COUNTS = {}
 ACTIVE_TURNS_PATH = CODEX_HOME / "supervisor" / "active-turns.json"
 GUI_PORT = configured_port("NEMOTRON_GUI_PORT", 5903)
 ACTIVE_TURNS = {}
@@ -163,6 +167,7 @@ def register_active_turn(value):
     active = sanitize_active_turn(value)
     with EVENTS_LOCK:
         ACTIVE_TURNS[active["turnId"]] = active
+        LAST_PROGRESS_MONOTONIC.setdefault(active["turnId"], time.monotonic())
         persist_active_turns()
     return {"ok": True, "turnId": active["turnId"]}
 
@@ -252,6 +257,7 @@ def monitor_active_turns_once():
 def active_turn_monitor():
     while True:
         monitor_active_turns_once()
+        record_supervisor_heartbeats_once()
         time.sleep(5)
 
 
@@ -304,6 +310,10 @@ def load_progress_state():
             TURN_PROGRESS_SEQUENCES[turn_id] = max(
                 TURN_PROGRESS_SEQUENCES.get(turn_id, 0), source_sequence,
             )
+            LAST_PROGRESS_BY_TURN[turn_id] = event
+            LAST_PROGRESS_MONOTONIC[turn_id] = time.monotonic()
+            if str(event_id).startswith("supervisor-heartbeat-"):
+                HEARTBEAT_COUNTS[turn_id] = HEARTBEAT_COUNTS.get(turn_id, 0) + 1
 
 
 def classify(event):
@@ -362,6 +372,7 @@ def record_event(value):
         SEEN_COMPLETIONS[key] = SEQUENCE
         if ACTIVE_TURNS.pop(event["turnId"], None) is not None:
             persist_active_turns()
+        LAST_PROGRESS_MONOTONIC.pop(event["turnId"], None)
         return {"ok": True, "duplicate": False, "sequence": SEQUENCE}
 
 
@@ -387,7 +398,63 @@ def record_progress(value):
         append_jsonl(PROGRESS_PATH, event)
         SEEN_PROGRESS_EVENTS[event["eventId"]] = PROGRESS_SEQUENCE
         TURN_PROGRESS_SEQUENCES[event["turnId"]] = event["sourceSequence"]
+        LAST_PROGRESS_BY_TURN[event["turnId"]] = event
+        LAST_PROGRESS_MONOTONIC[event["turnId"]] = time.monotonic()
         return {"ok": True, "duplicate": False, "sequence": PROGRESS_SEQUENCE}
+
+
+def record_supervisor_heartbeats_once(now=None):
+    """Persist factual English progress before an active turn is silent for two minutes."""
+
+    current = time.monotonic() if now is None else float(now)
+    with EVENTS_LOCK:
+        candidates = list(ACTIVE_TURNS.values())
+    recorded = 0
+    for active in candidates:
+        turn_id = active["turnId"]
+        last_at = LAST_PROGRESS_MONOTONIC.get(turn_id)
+        if last_at is None:
+            LAST_PROGRESS_MONOTONIC[turn_id] = current
+            continue
+        if current - last_at < PROGRESS_HEARTBEAT_SECONDS:
+            continue
+        previous = LAST_PROGRESS_BY_TURN.get(turn_id, {})
+        heartbeat_count = HEARTBEAT_COUNTS.get(turn_id, 0) + 1
+        next_action = bounded_text(previous.get("nextAction"), 180)
+        if next_action:
+            message = (
+                f"Background progress check {heartbeat_count}: the exact active turn remains "
+                f"registered and is continuing with {next_action.rstrip('.')}."
+            )
+        elif previous:
+            prior_message = bounded_text(previous.get("message"), 150).rstrip(".")
+            message = (
+                f"Background progress check {heartbeat_count}: the exact active turn remains "
+                f"registered after {prior_message.lower()}."
+            )
+        else:
+            message = (
+                f"Background progress check {heartbeat_count}: the exact turn is still active, "
+                "waiting for its first recorded result, and protected while the screen is off."
+            )
+        source_sequence = TURN_PROGRESS_SEQUENCES.get(turn_id, 0) + 1
+        event_id = f"supervisor-heartbeat-{turn_id}-{source_sequence}"
+        record_progress({
+            "schemaVersion": 1,
+            "eventId": event_id,
+            "sequence": source_sequence,
+            "turnId": turn_id,
+            "threadId": active["threadId"],
+            "actionId": bounded_text(previous.get("actionId")) or "active-turn",
+            "state": "working",
+            "message": message,
+            "verifiedResult": "The supervisor confirmed that this exact thread and turn remain active.",
+            "nextAction": next_action or "Continue the same active turn until a verified result is available.",
+            "technicalCategory": "runtime",
+        })
+        HEARTBEAT_COUNTS[turn_id] = heartbeat_count
+        recorded += 1
+    return recorded
 
 
 def read_progress(thread_id="", turn_id="", after=0):

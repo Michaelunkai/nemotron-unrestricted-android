@@ -49,6 +49,9 @@ class IntentTests(unittest.TestCase):
             ("settings", "com.example.app"),
             ("share-text", "private words"),
             ("view", "content://example/item/1", "--mime", "image/jpeg"),
+            ("map-search", "Eiffel Tower"),
+            ("directions", "Charles de Gaulle Airport", "--origin", "Eiffel Tower", "--mode", "transit"),
+            ("calendar-event", "Flight to Paris", "--start-ms", "1800000000000", "--end-ms", "1800003600000"),
             ("capture-image", "--output", "content://example/output/1"),
         )
         for case in cases:
@@ -69,6 +72,24 @@ class IntentTests(unittest.TestCase):
             self.intent["build"](type("Args", (), {
                 "workflow": "open-url", "url": "https://u:p@example.com", "package": None,
             })())
+
+    def test_travel_intents_are_encoded_typed_and_resolution_first(self):
+        _, maps, _ = self.invoke(
+            "directions", "Charles de Gaulle Airport", "--origin", "Eiffel Tower",
+            "--waypoint", "Gare du Nord", "--mode", "transit", "--navigate",
+        )
+        data = maps["spec"]["data"]
+        self.assertIn("api=1", data)
+        self.assertIn("destination=Charles+de+Gaulle+Airport", data)
+        self.assertIn("waypoints=Gare+du+Nord", data)
+        self.assertNotIn(" ", data)
+        _, event, command = self.invoke(
+            "calendar-event", "Flight to Paris", "--start-ms", "1800000000000",
+            "--end-ms", "1800003600000", "--location", "CDG",
+        )
+        self.assertEqual(event["spec"]["action"], "android.intent.action.INSERT")
+        self.assertNotIn("Flight to Paris", json.dumps(event["spec"]["extras"]))
+        self.assertEqual(command[1], "resolve-intent")
 
 
 if __name__ == "__main__":

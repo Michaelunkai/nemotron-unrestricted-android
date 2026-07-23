@@ -1,0 +1,353 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Create verified, resumable travel research and itinerary artifact packs."""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.parse
+import uuid
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT / "workspace" / "trips"
+STATE = ROOT / "runtime" / ".codex" / "automation" / "trips"
+SEARCH = os.environ.get("NEMOTRON_SEARCH_COMMAND", "codex-search")
+SAFE_NAME = re.compile(r"^[\w .,'()&+-]{1,160}$", re.UNICODE)
+SLUG = re.compile(r"[^a-z0-9]+")
+
+
+class TripError(Exception):
+    pass
+
+
+def bounded_string(value, field, limit=500):
+    if (
+        not isinstance(value, str) or not value.strip() or len(value) > limit
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise TripError(field + "_invalid")
+    return value.strip()
+
+
+def parse_date(value, field):
+    try:
+        return dt.date.fromisoformat(bounded_string(value, field, 10))
+    except ValueError as error:
+        raise TripError(field + "_invalid") from error
+
+
+def load_spec(path):
+    value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    allowed = {
+        "schemaVersion", "name", "origin", "destination", "startDate", "endDate",
+        "travelers", "transportModes", "interests", "accessibilityNeeds", "notes",
+    }
+    if not isinstance(value, dict) or set(value) - allowed or value.get("schemaVersion") != 1:
+        raise TripError("trip_schema_invalid")
+    name = bounded_string(value.get("name"), "trip_name", 120)
+    origin = bounded_string(value.get("origin"), "origin", 200)
+    destination = bounded_string(value.get("destination"), "destination", 200)
+    if not SAFE_NAME.fullmatch(origin) or not SAFE_NAME.fullmatch(destination):
+        raise TripError("trip_place_invalid")
+    start = parse_date(value.get("startDate"), "start_date")
+    end = parse_date(value.get("endDate"), "end_date")
+    if end < start or (end - start).days > 366:
+        raise TripError("trip_date_range_invalid")
+    travelers = value.get("travelers", 1)
+    if isinstance(travelers, bool) or not isinstance(travelers, int) or not 1 <= travelers <= 50:
+        raise TripError("travelers_invalid")
+    modes = value.get("transportModes", ["transit", "walking"])
+    allowed_modes = {"driving", "walking", "bicycling", "two-wheeler", "transit", "flight", "rail"}
+    if (
+        not isinstance(modes, list) or not 1 <= len(modes) <= 7
+        or any(mode not in allowed_modes for mode in modes)
+    ):
+        raise TripError("transport_modes_invalid")
+    interests = value.get("interests", [])
+    needs = value.get("accessibilityNeeds", [])
+    for field, items in (("interests", interests), ("accessibility_needs", needs)):
+        if (
+            not isinstance(items, list) or len(items) > 20
+            or any(not isinstance(item, str) or not item or len(item) > 100 or any(ord(ch) < 32 for ch in item)
+                    for item in items)
+        ):
+            raise TripError(field + "_invalid")
+    notes = value.get("notes", "")
+    if not isinstance(notes, str) or len(notes) > 4000 or any(ord(ch) < 9 for ch in notes):
+        raise TripError("trip_notes_invalid")
+    return {
+        "schemaVersion": 1,
+        "name": name,
+        "origin": origin,
+        "destination": destination,
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "travelers": travelers,
+        "transportModes": list(dict.fromkeys(modes)),
+        "interests": interests,
+        "accessibilityNeeds": needs,
+        "notes": notes,
+    }
+
+
+def maps_url(spec, mode=None):
+    route_mode = mode or next(
+        (item for item in spec["transportModes"] if item in {"driving", "walking", "bicycling", "two-wheeler", "transit"}),
+        "transit",
+    )
+    return "https://www.google.com/maps/dir/?" + urllib.parse.urlencode({
+        "api": "1",
+        "origin": spec["origin"],
+        "destination": spec["destination"],
+        "travelmode": route_mode,
+    })
+
+
+def research_queries(spec):
+    date_range = f"{spec['startDate']} to {spec['endDate']}"
+    base = [
+        f"{spec['origin']} to {spec['destination']} transport options {date_range} official",
+        f"{spec['destination']} lodging official sites {date_range} {spec['travelers']} travelers",
+        f"{spec['destination']} local public transport official visitor information",
+        f"{spec['destination']} weather forecast {date_range}",
+        f"{spec['destination']} entry requirements official tourism {date_range}",
+        f"{spec['destination']} current closures alerts official tourism {date_range}",
+    ]
+    if spec["interests"]:
+        base.append(
+            f"{spec['destination']} official visitor information "
+            + " ".join(spec["interests"][:6])
+        )
+    if spec["accessibilityNeeds"]:
+        base.append(
+            f"{spec['destination']} accessible travel official "
+            + " ".join(spec["accessibilityNeeds"][:6])
+        )
+    return base[:10]
+
+
+def ics_text(spec):
+    start = parse_date(spec["startDate"], "start_date")
+    end_exclusive = parse_date(spec["endDate"], "end_date") + dt.timedelta(days=1)
+    uid = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:24] + "@nemotron"
+    escape = lambda value: value.replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+    return "\r\n".join((
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Nemotron Unrestricted//Trip Pack 1.0//EN",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTART;VALUE=DATE:{start.strftime('%Y%m%d')}",
+        f"DTEND;VALUE=DATE:{end_exclusive.strftime('%Y%m%d')}",
+        f"SUMMARY:{escape(spec['name'])}",
+        f"LOCATION:{escape(spec['destination'])}",
+        f"DESCRIPTION:{escape('Trip from ' + spec['origin'] + '. Verify live bookings and times before travel.')}",
+        "END:VEVENT",
+        "END:VCALENDAR",
+        "",
+    ))
+
+
+def itinerary_text(spec, queries, route):
+    interests = ", ".join(spec["interests"]) or "No specific interests supplied"
+    needs = ", ".join(spec["accessibilityNeeds"]) or "No accessibility needs supplied"
+    return f"""# {spec['name']}
+
+- Origin: {spec['origin']}
+- Destination: {spec['destination']}
+- Dates: {spec['startDate']} through {spec['endDate']}
+- Travelers: {spec['travelers']}
+- Preferred modes: {", ".join(spec['transportModes'])}
+- Interests: {interests}
+- Accessibility: {needs}
+
+## Verified handoffs
+
+- Directions: {route}
+- Calendar artifact: `trip.ics`
+- Machine-readable plan: `trip.json`
+- Current research evidence: `research.json`
+
+## Autonomous workflow
+
+1. Compare current transport options and retain provider, timestamp, total price, duration, baggage, and cancellation evidence.
+2. Compare lodging by total stay price, exact location, cancellation rules, accessibility, and current availability.
+3. Check official entry, health, weather, transit, disruption, and closure sources.
+4. Build a time-feasible day plan with transfer buffers and opening-hour evidence.
+5. Open the selected provider or app through a verified intent or fresh semantic UI target.
+6. Continue automatically through reversible fields; stop only at a real account, identity, payment, legal-consent, or Android secure-surface gate.
+7. Re-read every booking summary before any irreversible purchase and never claim a reservation without provider confirmation.
+
+## Research queries
+
+""" + "\n".join(f"- {query}" for query in queries) + (
+        "\n\n## Notes\n\n" + spec["notes"].strip() + "\n" if spec["notes"].strip() else "\n"
+    )
+
+
+def file_receipt(path):
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def atomic_write(path, content, binary=False):
+    temporary = path.with_name(path.name + ".partial")
+    if binary:
+        temporary.write_bytes(content)
+    else:
+        temporary.write_text(content, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def create_pack(spec, research=False, max_queries=8):
+    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode()
+    slug = SLUG.sub("-", spec["name"].casefold()).strip("-")[:48] or "trip"
+    pack = WORKSPACE / f"{slug}-{hashlib.sha256(canonical).hexdigest()[:8]}-{uuid.uuid4().hex[:8]}"
+    pack.mkdir(parents=True, exist_ok=False)
+    queries = research_queries(spec)[:max_queries]
+    route = maps_url(spec)
+    results = []
+    if research:
+        for index, query in enumerate(queries, 1):
+            print(
+                f"Trip progress: researching current source set {index} of {len(queries)} for {spec['destination']}.",
+                file=sys.stderr,
+                flush=True,
+            )
+            completed = subprocess.run(
+                [SEARCH, "--count", "5", query],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            output = (completed.stdout if completed.returncode == 0 else completed.stderr)[:200_000]
+            results.append({
+                "query": query,
+                "exitCode": completed.returncode,
+                "completed": completed.returncode == 0,
+                "output": output,
+            })
+    research_record = {
+        "schemaVersion": 1,
+        "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "provider": "codex-search" if research else None,
+        "requested": research,
+        "queries": queries,
+        "results": results,
+        "complete": bool(research and results and all(item["completed"] for item in results)),
+    }
+    action_record = {
+        "schemaVersion": 1,
+        "directionsUrl": route,
+        "resolveDirections": [
+            "codex-intent", "directions", spec["destination"], "--origin", spec["origin"],
+            "--mode", next((mode for mode in spec["transportModes"] if mode in {
+                "driving", "walking", "bicycling", "two-wheeler", "transit",
+            }), "transit"),
+        ],
+        "calendarFile": str(pack / "trip.ics"),
+    }
+    files = {
+        "trip.json": json.dumps(spec, indent=2, sort_keys=True) + "\n",
+        "itinerary.md": itinerary_text(spec, queries, route),
+        "trip.ics": ics_text(spec),
+        "research.json": json.dumps(research_record, indent=2, sort_keys=True) + "\n",
+        "actions.json": json.dumps(action_record, indent=2, sort_keys=True) + "\n",
+    }
+    for name, content in files.items():
+        atomic_write(pack / name, content)
+    receipts = [file_receipt(pack / name) for name in sorted(files)]
+    record = {
+        "schemaVersion": 1,
+        "id": uuid.uuid4().hex,
+        "pack": str(pack),
+        "tripSha256": hashlib.sha256(canonical).hexdigest(),
+        "files": receipts,
+        "researchRequested": research,
+        "researchComplete": research_record["complete"],
+    }
+    STATE.mkdir(parents=True, exist_ok=True)
+    receipt = STATE / f"{record['id']}.json"
+    atomic_write(receipt, json.dumps(record, indent=2, sort_keys=True) + "\n")
+    return record, receipt
+
+
+def verify_receipt(path):
+    receipt = pathlib.Path(path).expanduser().resolve(strict=True)
+    if receipt.parent != STATE.resolve() or receipt.suffix != ".json":
+        raise TripError("trip_receipt_outside_state")
+    record = json.loads(receipt.read_text(encoding="utf-8"))
+    pack = pathlib.Path(record["pack"]).resolve(strict=True)
+    if pack.parent != WORKSPACE.resolve() or pack.is_symlink():
+        raise TripError("trip_pack_outside_workspace")
+    current = [file_receipt(path) for path in sorted(pack.iterdir()) if path.is_file()]
+    if current != record["files"]:
+        raise TripError("trip_pack_changed")
+    return record
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create and verify resumable travel-planning artifact packs.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create")
+    create.add_argument("spec")
+    create.add_argument("--research", action="store_true")
+    create.add_argument("--max-queries", type=int, default=8)
+    verify = commands.add_parser("verify")
+    verify.add_argument("receipt")
+    args = parser.parse_args()
+    try:
+        if args.command == "create":
+            if not 1 <= args.max_queries <= 10:
+                raise TripError("max_queries_invalid")
+            spec = load_spec(args.spec)
+            record, receipt = create_pack(spec, args.research, args.max_queries)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": not args.research or record["researchComplete"],
+                "record": record,
+                "receipt": str(receipt),
+                "message": (
+                    "Created and hashed the itinerary, calendar, map handoff, action, and current research artifacts."
+                    if args.research and record["researchComplete"] else
+                    "Created and hashed a resumable itinerary, calendar, map handoff, action, and research-query pack."
+                ),
+            }
+            code = 0 if output["taskVerified"] else 3
+        else:
+            record = verify_receipt(args.receipt)
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "record": record,
+                "message": "Verified every recorded trip artifact byte and workspace boundary.",
+            }
+            code = 0
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return code
+    except (TripError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "processCompleted": False,
+            "taskVerified": False,
+            "error": str(error),
+            "message": "Trip planning stopped without claiming unverified research, availability, prices, or bookings.",
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

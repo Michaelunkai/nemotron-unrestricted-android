@@ -1,0 +1,284 @@
+#!/data/data/com.termux/files/usr/bin/python
+"""Hash-gated deployment through already authenticated free-tier CLIs."""
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import uuid
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKSPACE = ROOT / "workspace"
+STATE = ROOT / "runtime" / ".codex" / "automation" / "deployments"
+PROVIDERS = {
+    "vercel": {"command": "vercel", "auth": ["whoami"]},
+    "cloudflare-pages": {"command": "wrangler", "auth": ["whoami", "--json"]},
+    "netlify": {"command": "netlify", "auth": ["status", "--json"]},
+}
+PROJECT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
+URL = re.compile(r"https://[A-Za-z0-9.-]+(?::\d+)?(?:/[^\s]*)?")
+
+
+class DeployError(Exception):
+    pass
+
+
+def workspace_path(value):
+    path = pathlib.Path(value).expanduser().resolve(strict=True)
+    workspace = WORKSPACE.resolve()
+    if not path.is_dir() or path.is_symlink() or (path != workspace and workspace not in path.parents):
+        raise DeployError("deployment_path_outside_workspace")
+    return path
+
+
+def hash_tree(root):
+    digest = hashlib.sha256()
+    files = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root)
+        if any(part in {".git", "node_modules", ".vercel", ".netlify", ".wrangler"} for part in relative.parts):
+            continue
+        if path.is_symlink():
+            raise DeployError("deployment_symlink_refused")
+        if path.stat().st_size > 25 * 1024 * 1024:
+            raise DeployError("deployment_file_too_large")
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
+        row = {"path": relative.as_posix(), "bytes": path.stat().st_size, "sha256": sha}
+        files.append(row)
+        digest.update(row["path"].encode() + b"\0" + sha.encode() + b"\n")
+        if len(files) > 20_000:
+            raise DeployError("deployment_file_limit")
+    if not files:
+        raise DeployError("deployment_empty")
+    return digest.hexdigest(), files
+
+
+def readiness():
+    results = {}
+    for provider, config in PROVIDERS.items():
+        executable = shutil.which(config["command"])
+        authenticated = False
+        if executable:
+            try:
+                completed = subprocess.run(
+                    [executable, *config["auth"]],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                authenticated = completed.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                authenticated = False
+        results[provider] = {
+            "installed": executable is not None,
+            "authenticated": authenticated,
+            "ready": executable is not None and authenticated,
+        }
+    return results
+
+
+def load_spec(path):
+    value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or set(value) != {
+        "schemaVersion", "provider", "project", "output", "projectName", "production",
+    } or value.get("schemaVersion") != 1:
+        raise DeployError("deployment_schema_invalid")
+    provider = value.get("provider")
+    if provider not in PROVIDERS:
+        raise DeployError("deployment_provider_invalid")
+    project = workspace_path(value.get("project"))
+    output = workspace_path(value.get("output"))
+    if output != project and project not in output.parents:
+        raise DeployError("deployment_output_outside_project")
+    name = value.get("projectName")
+    if not isinstance(name, str) or not PROJECT_NAME.fullmatch(name):
+        raise DeployError("deployment_project_name_invalid")
+    if not isinstance(value.get("production"), bool):
+        raise DeployError("deployment_production_invalid")
+    tree, files = hash_tree(output)
+    return {
+        "schemaVersion": 1,
+        "provider": provider,
+        "project": str(project),
+        "output": str(output),
+        "projectName": name,
+        "production": value["production"],
+        "treeSha256": tree,
+        "files": files,
+    }
+
+
+def plan_sha(plan):
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def provider_command(plan, executable):
+    if plan["provider"] == "vercel":
+        command = [executable, "deploy", plan["output"], "--yes"]
+        if plan["production"]:
+            command.append("--prod")
+        return command
+    if plan["provider"] == "cloudflare-pages":
+        command = [
+            executable, "pages", "deploy", plan["output"],
+            "--project-name", plan["projectName"],
+        ]
+        if plan["production"]:
+            command.extend(("--branch", "main"))
+        return command
+    command = [executable, "deploy", "--dir", plan["output"], "--json"]
+    if plan["production"]:
+        command.append("--prod")
+    return command
+
+
+def extract_url(provider, stdout):
+    if provider == "netlify":
+        try:
+            value = json.loads(stdout)
+            for key in ("deploy_url", "url", "ssl_url"):
+                if isinstance(value.get(key), str) and value[key].startswith("https://"):
+                    return value[key]
+        except json.JSONDecodeError:
+            pass
+    matches = URL.findall(stdout)
+    if not matches:
+        raise DeployError("deployment_url_missing")
+    return matches[-1].rstrip(".,)")
+
+
+def verify_live(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "Nemotron-Deployment-Verifier/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read(2 * 1024 * 1024)
+        if not 200 <= response.status < 300 or not body:
+            raise DeployError("deployment_live_verification_failed")
+        return {
+            "url": response.geturl(),
+            "status": response.status,
+            "bytesRead": len(body),
+            "bodyPrefixSha256": hashlib.sha256(body).hexdigest(),
+        }
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".partial")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Preflight, plan, and verify free-tier CLI deployments.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    plan_command = commands.add_parser("plan")
+    plan_command.add_argument("spec")
+    run = commands.add_parser("run")
+    run.add_argument("spec")
+    run.add_argument("--plan-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "status":
+            providers = readiness()
+            output = {
+                "schemaVersion": 1,
+                "processCompleted": True,
+                "taskVerified": True,
+                "providers": providers,
+                "readyProviders": [name for name, value in providers.items() if value["ready"]],
+                "message": (
+                    "Checked installed deployment CLIs and existing authentication without opening a browser "
+                    "or changing an account."
+                ),
+            }
+        else:
+            plan = load_spec(args.spec)
+            sha = plan_sha(plan)
+            if args.command == "plan":
+                state = readiness()[plan["provider"]]
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": True,
+                    "dryRun": True,
+                    "plan": plan,
+                    "planSha256": sha,
+                    "providerReadiness": state,
+                    "externalGate": None if state["ready"] else "provider_cli_or_account_authorization_required",
+                    "message": "Hashed the exact deployment tree and checked provider readiness without deploying.",
+                }
+            else:
+                if sha != args.plan_sha256:
+                    raise DeployError("deployment_plan_hash_mismatch")
+                state = readiness()[plan["provider"]]
+                if not state["ready"]:
+                    raise DeployError("provider_cli_or_account_authorization_required")
+                executable = shutil.which(PROVIDERS[plan["provider"]]["command"])
+                completed = subprocess.run(
+                    provider_command(plan, executable),
+                    cwd=plan["project"],
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    raise DeployError("deployment_command_failed")
+                url = extract_url(plan["provider"], completed.stdout)
+                live = verify_live(url)
+                current_tree, current_files = hash_tree(pathlib.Path(plan["output"]))
+                if current_tree != plan["treeSha256"] or current_files != plan["files"]:
+                    raise DeployError("deployment_source_changed")
+                record = {
+                    "schemaVersion": 1,
+                    "id": uuid.uuid4().hex,
+                    "planSha256": sha,
+                    "provider": plan["provider"],
+                    "projectName": plan["projectName"],
+                    "production": plan["production"],
+                    "sourceTreeSha256": current_tree,
+                    "live": live,
+                }
+                receipt = STATE / f"{record['id']}.json"
+                atomic_json(receipt, record)
+                output = {
+                    "schemaVersion": 1,
+                    "processCompleted": True,
+                    "taskVerified": True,
+                    "receipt": str(receipt),
+                    "record": record,
+                    "message": "Deployed the exact hash-bound tree and verified the public HTTPS response.",
+                }
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    except (
+        DeployError, OSError, ValueError, json.JSONDecodeError,
+        subprocess.TimeoutExpired,
+    ) as error:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "processCompleted": False,
+            "taskVerified": False,
+            "error": str(error),
+            "manualActionRequired": str(error) == "provider_cli_or_account_authorization_required",
+            "message": (
+                "Deployment stopped without claiming a public result; the provider CLI or account "
+                "authorization is an external gate."
+                if str(error) == "provider_cli_or_account_authorization_required" else
+                "Deployment stopped without claiming an unverified build, upload, or public URL."
+            ),
+        }, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -55,7 +55,7 @@ if [ "$staged_count" -gt 0 ]; then
 fi
 "$APP_HOME/build-nemotron-unrestricted.sh"
 
-APK="$APP_HOME/dist/Nemotron-Unrestricted-1.7.0.apk"
+APK="$APP_HOME/dist/Nemotron-Unrestricted-1.8.0.apk"
 test -s "$APK" && test -s "$APK.sha256"
 (cd "$APP_HOME/dist" && sha256sum -c --status "$(basename "$APK.sha256")")
 zipalign -c 4 "$APK"
@@ -65,7 +65,7 @@ printf '%s\n' "$verification" | grep -Fq 'Verified using v2 scheme (APK Signatur
 printf '%s\n' "$verification" | grep -Fq 'Verified using v3 scheme (APK Signature Scheme v3): true'
 [ -s "$APK.idsig" ] || { printf 'RELEASE_V4_SIDECAR_MISSING\n' >&2; exit 1; }
 printf 'RELEASE_V4_SIDECAR_PRESENT verifier_confirmation_unavailable\n'
-aapt dump badging "$APK" | grep -q "package: name='com.michaelovsky.nemotronunrestricted.isolated' versionCode='8' versionName='1.7.0'"
+aapt dump badging "$APK" | grep -q "package: name='com.michaelovsky.nemotronunrestricted.isolated' versionCode='9' versionName='1.8.0'"
 signer=$(printf '%s\n' "$verification" | awk -F': ' '/certificate SHA-256 digest:/ {print $NF; exit}')
 printf '%s' "$signer" | grep -Eq '^[0-9a-f]{64}$' || { printf 'RELEASE_SIGNER_UNAVAILABLE\n' >&2; exit 1; }
 verify_preservation

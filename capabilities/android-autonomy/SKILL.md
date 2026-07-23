@@ -15,6 +15,14 @@ Use this skill whenever the request involves an Android app, visible UI, gallery
 3. Read the fresh screen with `codex-android dump`; use text/resource descriptions when present and coordinates only from current bounds.
 4. Tap/type/swipe, dump again, and verify the requested visible postcondition. Retry bounded alternatives after stale UI or navigation changes.
 5. Never bypass Android authentication, device locks, account consent, payment confirmation, or another person's access controls. Report such an actual external gate precisely only after autonomous supported routes are exhausted.
+6. For unfamiliar screens, run `codex-ui-safe suggest --package <id> --goal '<action>'`, select a fresh unique semantic candidate, then execute with an exact selector and mandatory after-selector. Refresh after every navigation because nodes become stale.
+
+## Travel and local planning
+
+- Create a durable trip workspace with `codex-trip create <spec.json> --research`; verify the returned receipt before relying on it.
+- Use `codex-intent map-search`, `directions`, and `calendar-event` in resolution mode first, then execute the exact resolved handoff when it advances the requested trip.
+- Compare current total prices, durations, transfers, baggage, cancellation, accessibility, weather, entry rules, local transit, and closures with timestamped sources. A search result is research evidence, not a booking.
+- Continue through reversible app and browser fields autonomously. Account sign-in, identity, legal consent, and payment confirmation remain real provider/Android gates and are never silently bypassed.
 
 ## Facebook and web apps
 

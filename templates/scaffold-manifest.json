@@ -64,6 +64,45 @@
       },
       "verify": ["javac", "Main.java"]
     },
+    "c-cli": {
+      "files": {
+        ".gitignore": "{{PROJECT_NAME}}\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nVerify with `clang -std=c17 -fsyntax-only main.c` and build with `clang -std=c17 main.c -o {{PROJECT_NAME}}`.\n",
+        "main.c": "#include <stdio.h>\n\nint main(void) {\n    puts(\"{{PROJECT_NAME}} ready\");\n    return 0;\n}\n"
+      },
+      "verify": ["clang", "-std=c17", "-fsyntax-only", "main.c"]
+    },
+    "cpp-cli": {
+      "files": {
+        ".gitignore": "{{PROJECT_NAME}}\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nVerify with `clang++ -std=c++17 -fsyntax-only main.cpp` and build with `clang++ -std=c++17 main.cpp -o {{PROJECT_NAME}}`.\n",
+        "main.cpp": "#include <iostream>\n\nint main() {\n    std::cout << \"{{PROJECT_NAME}} ready\\n\";\n    return 0;\n}\n"
+      },
+      "verify": ["clang++", "-std=c++17", "-fsyntax-only", "main.cpp"]
+    },
+    "node-fullstack": {
+      "files": {
+        ".gitignore": "node_modules/\n.env*\n",
+        "README.md": "# {{PROJECT_TITLE}}\n\nDependency-free Node full-stack baseline. Run `npm test`, then `npm start` and open http://127.0.0.1:3000.\n",
+        "package.json": "{\"name\":\"{{PROJECT_NAME}}\",\"version\":\"0.1.0\",\"private\":true,\"scripts\":{\"start\":\"node server.js\",\"test\":\"node --test\"}}\n",
+        "public/index.html": "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{{PROJECT_TITLE}}</title><link rel=\"stylesheet\" href=\"style.css\"></head><body><main><h1>{{PROJECT_TITLE}}</h1><p id=\"status\">Loading…</p></main><script src=\"app.js\"></script></body></html>\n",
+        "public/style.css": ":root{font-family:system-ui;color-scheme:light dark}body{margin:0;min-height:100vh;display:grid;place-items:center}main{max-width:48rem;padding:2rem}\n",
+        "public/app.js": "'use strict';\nfetch('/api/health').then(response => response.json()).then(value => { document.querySelector('#status').textContent = value.message; });\n",
+        "server.js": "'use strict';\nconst http = require('node:http');\nconst fs = require('node:fs');\nconst path = require('node:path');\nfunction handler(request, response) {\n  if (request.url === '/api/health') { response.writeHead(200, {'content-type':'application/json'}); return response.end(JSON.stringify({ok:true,message:'{{PROJECT_NAME}} ready'})); }\n  const requested = request.url === '/' ? 'index.html' : request.url.slice(1);\n  if (!['index.html','style.css','app.js'].includes(requested)) { response.writeHead(404); return response.end('Not found'); }\n  response.writeHead(200); response.end(fs.readFileSync(path.join(__dirname, 'public', requested)));\n}\nif (require.main === module) http.createServer(handler).listen(3000, '127.0.0.1');\nmodule.exports = { handler };\n",
+        "test.js": "'use strict';\nconst test = require('node:test');\nconst assert = require('node:assert/strict');\nconst {handler} = require('./server');\ntest('health', () => { let body=''; const response={writeHead(code){assert.equal(code,200)},end(value){body+=value}}; handler({url:'/api/health'},response); assert.match(body,/ready/); });\n"
+      },
+      "verify": ["npm", "test", "--silent"]
+    },
+    "pwa-static": {
+      "files": {
+        "README.md": "# {{PROJECT_TITLE}}\n\nInstallable dependency-free PWA baseline. Serve this directory over HTTPS or localhost.\n",
+        "index.html": "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"theme-color\" content=\"#17152d\"><link rel=\"manifest\" href=\"manifest.webmanifest\"><title>{{PROJECT_TITLE}}</title></head><body><main><h1>{{PROJECT_TITLE}}</h1><p>Offline-ready.</p></main><script src=\"app.js\"></script></body></html>\n",
+        "app.js": "'use strict';\nif ('serviceWorker' in navigator) navigator.serviceWorker.register('./service-worker.js');\n",
+        "service-worker.js": "'use strict';\nconst CACHE='{{PROJECT_NAME}}-v1';\nself.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(['./','./index.html','./app.js','./manifest.webmanifest']))));\nself.addEventListener('fetch', event => event.respondWith(caches.match(event.request).then(value => value || fetch(event.request))));\n",
+        "manifest.webmanifest": "{\"name\":\"{{PROJECT_TITLE}}\",\"short_name\":\"{{PROJECT_NAME}}\",\"start_url\":\"./\",\"display\":\"standalone\",\"background_color\":\"#17152d\",\"theme_color\":\"#17152d\"}\n"
+      },
+      "verify": ["python", "-c", "import json; from pathlib import Path; json.loads(Path('manifest.webmanifest').read_text()); assert '<!doctype html>' in Path('index.html').read_text().lower()"]
+    },
     "powershell-tool": {
       "files": {
         "README.md": "# {{PROJECT_TITLE}}\n\nRun `pwsh -NoProfile -File tool.ps1` on the paired PC.\n",

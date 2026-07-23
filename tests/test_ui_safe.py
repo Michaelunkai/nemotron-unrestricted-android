@@ -38,6 +38,42 @@ class UiSafeTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "selector_ambiguous"):
             MODULE["find"](duplicate, {"text": "x"})
 
+    def test_semantic_selector_understands_common_action_equivalents(self):
+        root = MODULE["ET"].fromstring(
+            '<hierarchy>'
+            '<node text="Done" resource-id="app:id/complete" content-desc="" class="android.widget.Button" clickable="true" enabled="true" bounds="[10,20][110,80]" />'
+            '<node text="Help" resource-id="app:id/help" content-desc="" class="android.widget.Button" clickable="true" enabled="true" bounds="[10,90][110,150]" />'
+            '</hierarchy>'
+        )
+        target = MODULE["find"](root, MODULE["selector"]({
+            "semanticText": "save", "clickable": True, "enabled": True,
+        }))
+        self.assertEqual(target.attrib["text"], "Done")
+        suggestions = MODULE["semantic_suggestions"](root, "save changes", 5)
+        self.assertEqual(suggestions[0]["text"], "Done")
+        self.assertGreaterEqual(suggestions[0]["score"], 60)
+
+    def test_semantic_selector_refuses_close_competing_targets(self):
+        root = MODULE["ET"].fromstring(
+            '<hierarchy>'
+            '<node text="Continue" clickable="true" enabled="true" bounds="[0,0][10,10]" />'
+            '<node text="Next" clickable="true" enabled="true" bounds="[20,0][30,10]" />'
+            '</hierarchy>'
+        )
+        with self.assertRaisesRegex(Exception, "semantic_selector_ambiguous"):
+            MODULE["find"](root, {"semanticText": "continue", "clickable": True})
+
+    def test_semantic_suggestions_omit_password_nodes(self):
+        root = MODULE["ET"].fromstring(
+            '<hierarchy>'
+            '<node text="Login" password="true" enabled="true" bounds="[0,0][10,10]" />'
+            '<node text="Sign in" password="false" clickable="true" enabled="true" bounds="[20,0][30,10]" />'
+            '</hierarchy>'
+        )
+        suggestions = MODULE["semantic_suggestions"](root, "login", 5)
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0]["text"], "Sign in")
+
     def test_workflow_requires_postconditions_and_rejects_bad_fallback(self):
         with self.assertRaisesRegex(Exception, "selector_invalid"):
             MODULE["validate_spec"]([{"action": "click", "selector": {"text": "x"}}])

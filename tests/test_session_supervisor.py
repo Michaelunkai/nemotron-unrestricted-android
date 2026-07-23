@@ -27,6 +27,9 @@ class SessionSupervisorTests(unittest.TestCase):
         SUPERVISOR.SEEN_COMPLETIONS.clear()
         SUPERVISOR.SEEN_PROGRESS_EVENTS.clear()
         SUPERVISOR.TURN_PROGRESS_SEQUENCES.clear()
+        SUPERVISOR.LAST_PROGRESS_BY_TURN.clear()
+        SUPERVISOR.LAST_PROGRESS_MONOTONIC.clear()
+        SUPERVISOR.HEARTBEAT_COUNTS.clear()
         SUPERVISOR.ACTIVE_TURNS.clear()
         SUPERVISOR.NOTIFICATION_ACKS.clear()
 
@@ -242,6 +245,63 @@ class SessionSupervisorTests(unittest.TestCase):
         self.assertEqual(SUPERVISOR.PROGRESS_SEQUENCE, 1)
         self.assertEqual(SUPERVISOR.SEEN_PROGRESS_EVENTS["progress-event-7"], 1)
         self.assertEqual(SUPERVISOR.TURN_PROGRESS_SEQUENCES["turn-progress"], 7)
+
+    def test_active_turn_gets_factual_english_heartbeat_before_two_minutes(self):
+        SUPERVISOR.register_active_turn({
+            "turnId": "turn-heartbeat",
+            "threadId": "thread-heartbeat",
+            "startedAt": 123,
+        })
+        SUPERVISOR.record_progress({
+            "schemaVersion": 1,
+            "eventId": "progress-before-wait",
+            "sequence": 4,
+            "turnId": "turn-heartbeat",
+            "threadId": "thread-heartbeat",
+            "actionId": "trip-research",
+            "state": "working",
+            "message": "Verified the destination and travel dates",
+            "verifiedResult": "The trip inputs are complete",
+            "nextAction": "Compare current transport options",
+            "technicalCategory": "verification",
+        })
+        last = SUPERVISOR.LAST_PROGRESS_MONOTONIC["turn-heartbeat"]
+        self.assertEqual(
+            SUPERVISOR.record_supervisor_heartbeats_once(
+                last + SUPERVISOR.PROGRESS_HEARTBEAT_SECONDS - 1
+            ),
+            0,
+        )
+        self.assertEqual(
+            SUPERVISOR.record_supervisor_heartbeats_once(
+                last + SUPERVISOR.PROGRESS_HEARTBEAT_SECONDS
+            ),
+            1,
+        )
+        rows = [json.loads(line) for line in SUPERVISOR.PROGRESS_PATH.read_text().splitlines()]
+        heartbeat = rows[-1]
+        self.assertEqual(heartbeat["sourceSequence"], 5)
+        self.assertEqual(heartbeat["technicalCategory"], "runtime")
+        self.assertIn("Compare current transport options", heartbeat["message"])
+        self.assertNotIn("curl", heartbeat["message"])
+        self.assertLess(SUPERVISOR.PROGRESS_HEARTBEAT_SECONDS, 120)
+
+    def test_heartbeat_without_prior_progress_reports_exact_wait_state(self):
+        SUPERVISOR.register_active_turn({
+            "turnId": "turn-first-result",
+            "threadId": "thread-first-result",
+            "startedAt": 123,
+        })
+        last = SUPERVISOR.LAST_PROGRESS_MONOTONIC["turn-first-result"]
+        self.assertEqual(
+            SUPERVISOR.record_supervisor_heartbeats_once(
+                last + SUPERVISOR.PROGRESS_HEARTBEAT_SECONDS
+            ),
+            1,
+        )
+        heartbeat = json.loads(SUPERVISOR.PROGRESS_PATH.read_text().splitlines()[-1])
+        self.assertIn("waiting for its first recorded result", heartbeat["message"])
+        self.assertEqual(heartbeat["sourceSequence"], 1)
 
 
 if __name__ == "__main__":

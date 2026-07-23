@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 
-from nemotron_android_policy import run_rish
+from nemotron_android_policy import AndroidBridgeError, AndroidPolicyError, run_rish
 from nemotron_automation import AutomationState
 
 
@@ -18,6 +18,22 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCTOR = os.environ.get("NEMOTRON_DOCTOR_COMMAND", str(ROOT / "bin" / "codex-doctor"))
 TERMUX_BIN = pathlib.Path("/data/data/com.termux/files/usr/bin")
 SAFE_PROPERTY = re.compile(r"^[\w .,+()/:@-]{0,256}$")
+PERMISSION_ROW = re.compile(r"^\s*(android\.permission\.[A-Z0-9_]+): granted=(true|false)\b")
+CAPABILITY_PERMISSIONS = {
+    "calendar": {"android.permission.READ_CALENDAR", "android.permission.WRITE_CALENDAR"},
+    "camera": {"android.permission.CAMERA"},
+    "contacts": {"android.permission.READ_CONTACTS", "android.permission.WRITE_CONTACTS"},
+    "location": {"android.permission.ACCESS_COARSE_LOCATION", "android.permission.ACCESS_FINE_LOCATION"},
+    "microphone": {"android.permission.RECORD_AUDIO"},
+    "notifications": {"android.permission.POST_NOTIFICATIONS"},
+    "phone": {"android.permission.CALL_PHONE", "android.permission.READ_PHONE_STATE"},
+    "sms": {"android.permission.READ_SMS", "android.permission.SEND_SMS"},
+    "storage-media": {
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+    },
+}
 
 
 class DeviceError(Exception):
@@ -49,6 +65,58 @@ def parse_lines(text, prefix):
     if len(values) > 10_000:
         raise DeviceError("device_inventory_limit")
     return values
+
+
+def parse_permission_grants(text):
+    values = {}
+    for line in text.splitlines():
+        match = PERMISSION_ROW.match(line)
+        if match:
+            values[match.group(1)] = match.group(2) == "true"
+    return values
+
+
+def permission_readiness():
+    packages = {
+        "termux": "com.termux",
+        "nemotron": "com.michaelovsky.nemotronunrestricted.isolated",
+    }
+    grants = {}
+    for name, package in packages.items():
+        result = run_rish(
+            "dumpsys package " + package
+            + r" | grep -E 'android\.permission\.[A-Z0-9_]+: granted='",
+            require_success=False,
+        )
+        if result.remote_status not in {0, 1}:
+            raise DeviceError("permission_readback_failed")
+        parsed = parse_permission_grants(result.stdout)
+        grants[name] = {
+            "package": package,
+            "granted": sorted(permission for permission, granted in parsed.items() if granted),
+            "declaredButNotGranted": sorted(permission for permission, granted in parsed.items() if not granted),
+        }
+    termux_granted = set(grants["termux"]["granted"])
+    capabilities = {
+        name: {
+            "requiredPermissions": sorted(required),
+            "grantedPermissions": sorted(required & termux_granted),
+            "missingPermissions": sorted(required - termux_granted),
+            "ready": bool(required) and required <= termux_granted,
+        }
+        for name, required in CAPABILITY_PERMISSIONS.items()
+    }
+    return {
+        "schemaVersion": 1,
+        "processCompleted": True,
+        "taskVerified": True,
+        "packages": grants,
+        "termuxApiCapabilities": capabilities,
+        "message": (
+            "Read back declared Android runtime permission grants for Termux and Nemotron; "
+            "no permission prompt, settings change, or protected operation was attempted."
+        ),
+    }
 
 
 def doctor_receipt():
@@ -141,18 +209,27 @@ def status(fragment=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Refresh, inspect, or search the safe Android device registry.")
+    parser = argparse.ArgumentParser(description="Refresh, inspect, search, or audit the safe Android device registry.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("refresh")
     commands.add_parser("status")
+    commands.add_parser("permissions")
     search = commands.add_parser("search")
     search.add_argument("fragment")
     args = parser.parse_args()
     try:
-        value = refresh() if args.command == "refresh" else status(args.fragment if args.command == "search" else None)
+        if args.command == "refresh":
+            value = refresh()
+        elif args.command == "permissions":
+            value = permission_readiness()
+        else:
+            value = status(args.fragment if args.command == "search" else None)
         print(json.dumps(value, ensure_ascii=False, sort_keys=True))
         return 0 if value["taskVerified"] else 4
-    except (DeviceError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (
+        DeviceError, AndroidBridgeError, AndroidPolicyError, OSError, ValueError,
+        subprocess.TimeoutExpired,
+    ) as error:
         print(json.dumps({
             "schemaVersion": 1, "processCompleted": False, "taskVerified": False,
             "error": str(error), "message": "Device registry refresh stopped without persisting unverified identity or readiness.",

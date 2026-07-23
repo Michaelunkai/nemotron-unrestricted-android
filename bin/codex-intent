@@ -58,6 +58,59 @@ def build(args):
             "kind": "activity", "action": "android.intent.action.VIEW",
             "data": uri(args.uri, {"content", "http", "https"}), "type": args.mime,
         }
+    elif args.workflow == "map-search":
+        if not args.query or len(args.query) > 1000 or any(ord(ch) < 32 for ch in args.query):
+            raise IntentError("map_query_invalid")
+        data = "https://www.google.com/maps/search/?" + urllib.parse.urlencode({
+            "api": "1", "query": args.query,
+        })
+        spec = {"kind": "activity", "action": "android.intent.action.VIEW", "data": data}
+    elif args.workflow == "directions":
+        values = {
+            "api": "1",
+            "destination": args.destination,
+            "travelmode": args.mode,
+        }
+        if args.origin:
+            values["origin"] = args.origin
+        if args.waypoint:
+            values["waypoints"] = "|".join(args.waypoint)
+        if args.navigate:
+            values["dir_action"] = "navigate"
+        if any(
+            not isinstance(value, str) or not value or len(value) > 1000
+            or any(ord(ch) < 32 for ch in value)
+            for key, value in values.items() if key not in {"api", "travelmode", "dir_action"}
+        ):
+            raise IntentError("directions_place_invalid")
+        data = "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(values)
+        spec = {"kind": "activity", "action": "android.intent.action.VIEW", "data": data}
+    elif args.workflow == "calendar-event":
+        if (
+            not args.title or len(args.title) > 1000 or any(ord(ch) < 32 for ch in args.title)
+            or args.end_ms <= args.start_ms
+        ):
+            raise IntentError("calendar_event_invalid")
+        extras = {
+            "title": args.title,
+            "beginTime": args.start_ms,
+            "endTime": args.end_ms,
+            "allDay": bool(args.all_day),
+        }
+        if args.location:
+            if len(args.location) > 1000 or any(ord(ch) < 32 for ch in args.location):
+                raise IntentError("calendar_location_invalid")
+            extras["eventLocation"] = args.location
+        if args.description:
+            if len(args.description) > 4000 or any(ord(ch) < 9 for ch in args.description):
+                raise IntentError("calendar_description_invalid")
+            extras["description"] = args.description
+        spec = {
+            "kind": "activity",
+            "action": "android.intent.action.INSERT",
+            "data": "content://com.android.calendar/events",
+            "extras": extras,
+        }
     else:
         output = uri(args.output, {"content"})
         spec = {
@@ -91,9 +144,29 @@ def main():
     view = workflows.add_parser("view")
     view.add_argument("uri")
     view.add_argument("--mime", required=True)
+    map_search = workflows.add_parser("map-search")
+    map_search.add_argument("query")
+    directions = workflows.add_parser("directions")
+    directions.add_argument("destination")
+    directions.add_argument("--origin")
+    directions.add_argument("--waypoint", action="append", default=[])
+    directions.add_argument(
+        "--mode", choices=("driving", "walking", "bicycling", "two-wheeler", "transit"),
+        default="driving",
+    )
+    directions.add_argument("--navigate", action="store_true")
+    calendar = workflows.add_parser("calendar-event")
+    calendar.add_argument("title")
+    calendar.add_argument("--start-ms", type=int, required=True)
+    calendar.add_argument("--end-ms", type=int, required=True)
+    calendar.add_argument("--location")
+    calendar.add_argument("--description")
+    calendar.add_argument("--all-day", action="store_true")
     capture = workflows.add_parser("capture-image")
     capture.add_argument("--output", required=True)
-    for command in (open_url, open_app, settings, share, view, capture):
+    for command in (
+        open_url, open_app, settings, share, view, map_search, directions, calendar, capture,
+    ):
         command.add_argument("--package")
         command.add_argument("--execute", action="store_true")
     args = parser.parse_args()

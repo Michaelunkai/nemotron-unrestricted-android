@@ -17,9 +17,13 @@ import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 ALLOWED_ROOTS = (ROOT, ROOT / "runtime" / "home" / "Documents")
-LANGUAGES = ("python", "node", "shell", "java", "kotlin", "android", "powershell", "static-web")
+LANGUAGES = (
+    "python", "node", "shell", "c", "cpp", "java", "kotlin", "android",
+    "powershell", "static-web",
+)
 SUFFIXES = {
     "python": {".py"}, "node": {".js", ".cjs", ".mjs"}, "shell": {".sh"},
+    "c": {".c", ".h"}, "cpp": {".cc", ".cpp", ".cxx", ".hpp", ".hh"},
     "java": {".java"}, "kotlin": {".kt", ".kts"}, "powershell": {".ps1", ".psm1"},
     "static-web": {".html", ".htm", ".css", ".js"},
 }
@@ -61,6 +65,8 @@ def detect(path):
         "android": ["AndroidManifest.xml", "settings.gradle", "settings.gradle.kts"],
         "python": ["pyproject.toml", "requirements.txt", "setup.py"],
         "node": ["package.json"],
+        "c": ["CMakeLists.txt", "Makefile"],
+        "cpp": ["CMakeLists.txt", "Makefile"],
         "java": ["pom.xml", "build.gradle"],
         "kotlin": ["build.gradle.kts"],
         "powershell": [],
@@ -71,7 +77,7 @@ def detect(path):
     for language, names in markers.items():
         if any((path / name).is_file() for name in names):
             found.append(language)
-    for language in ("python", "node", "shell", "java", "kotlin", "powershell", "static-web"):
+    for language in ("python", "node", "shell", "c", "cpp", "java", "kotlin", "powershell", "static-web"):
         if language in found:
             continue
         if files_for(path, SUFFIXES[language]):
@@ -126,6 +132,18 @@ def verify(path, language):
         sources = files_for(path, SUFFIXES[language])
         for source in sources:
             evidence.append(run_checked(["bash", "-n", str(source)], path))
+    elif language in {"c", "cpp"}:
+        sources = files_for(path, SUFFIXES[language])
+        compiler = "clang" if language == "c" else "clang++"
+        compilable = [
+            source for source in sources
+            if source.suffix.lower() in ({".c"} if language == "c" else {".cc", ".cpp", ".cxx"})
+        ]
+        if not compilable:
+            raise ToolchainError("source_files_missing")
+        standard = "-std=c17" if language == "c" else "-std=c++17"
+        evidence.append(run_checked([compiler, standard, "-fsyntax-only", *map(str, compilable)], path))
+        level = "native-syntax"
     elif language == "java":
         sources = files_for(path, SUFFIXES[language])
         with tempfile.TemporaryDirectory() as output:
@@ -194,6 +212,7 @@ def main():
                     "adapterAvailable": True,
                     "nativeRuntimeAvailable": shutil.which({
                         "python": "python", "node": "node", "shell": "bash", "java": "javac",
+                        "c": "clang", "cpp": "clang++",
                         "kotlin": "kotlinc", "android": "aapt", "powershell": "pwsh", "static-web": "python",
                     }[language]) is not None
                 } for language in LANGUAGES

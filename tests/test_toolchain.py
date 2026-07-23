@@ -26,6 +26,7 @@ class ToolchainTests(unittest.TestCase):
         for template, language in (
             ("python-app", "python"), ("node-app", "node"), ("shell-tool", "shell"),
             ("html-static", "static-web"), ("java-app", "java"),
+            ("c-cli", "c"), ("cpp-cli", "cpp"), ("node-fullstack", "node"),
         ):
             receipt = self.scaffold(template)
             target = receipt["project"]["target"]

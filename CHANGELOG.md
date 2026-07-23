@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.0 — 2026-07-23
+
+- Added 105-second factual English progress heartbeats for every active turn.
+- Added verified trip research packs, encoded map directions, and calendar handoffs.
+- Added semantic Android UI target ranking and read-only permission readiness.
+- Added C/C++ and full-stack/PWA scaffolds plus credential-aware free-tier deployment preflights.
+
 ## 1.7.0 — 2026-07-23
 
 - Automatically render every verified gallery match inline in the same conversation, independent of model Markdown behavior.

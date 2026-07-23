@@ -30,6 +30,17 @@ class DeviceTests(unittest.TestCase):
             ["com.example.a", "com.example.b"],
         )
 
+    def test_permission_parser_and_capability_map_are_truthful(self):
+        parsed = MODULE["parse_permission_grants"](
+            "  android.permission.CAMERA: granted=true, flags=[ USER_SET ]\n"
+            "  android.permission.RECORD_AUDIO: granted=false, flags=[ USER_SET ]\n"
+            "  unrelated\n"
+        )
+        self.assertTrue(parsed["android.permission.CAMERA"])
+        self.assertFalse(parsed["android.permission.RECORD_AUDIO"])
+        self.assertIn("camera", MODULE["CAPABILITY_PERMISSIONS"])
+        self.assertIn("android.permission.ACCESS_FINE_LOCATION", MODULE["CAPABILITY_PERMISSIONS"]["location"])
+
 
 if __name__ == "__main__":
     unittest.main()

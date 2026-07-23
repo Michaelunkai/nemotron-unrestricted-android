@@ -5,8 +5,8 @@ APP_HOME="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ANDROID_JAR="$APP_HOME/build-tools/android.jar"
 KEYSTORE="$APP_HOME/build/nemotron-unrestricted.keystore"
 SIGNING_PROPERTIES="$APP_HOME/build/signing.properties"
-VERSION_CODE="8"
-VERSION_NAME="1.7.0"
+VERSION_CODE="9"
+VERSION_NAME="1.8.0"
 REPRODUCIBLE_ZIP_DATE="2008-01-01T00:00:00Z"
 ARTIFACT="Nemotron-Unrestricted-$VERSION_NAME.apk"
 OUTPUT="$APP_HOME/dist/$ARTIFACT"
@@ -59,6 +59,8 @@ for required_executable in \
 	  "$APP_HOME/bin/codex-intent" \
 	  "$APP_HOME/bin/codex-ui-safe" \
 	  "$APP_HOME/bin/codex-device" \
+	  "$APP_HOME/bin/codex-trip" \
+	  "$APP_HOME/bin/codex-deploy" \
 	  "$APP_HOME/bin/codex-netdiag" \
 	  "$APP_HOME/bin/codex-secrets" \
 	  "$APP_HOME/bin/codex-security" \
@@ -158,6 +160,8 @@ python - \
   "$APP_HOME/bin/codex-intent" \
   "$APP_HOME/bin/codex-ui-safe" \
   "$APP_HOME/bin/codex-device" \
+  "$APP_HOME/bin/codex-trip" \
+  "$APP_HOME/bin/codex-deploy" \
   "$APP_HOME/bin/codex-netdiag" \
   "$APP_HOME/bin/codex-secrets" \
   "$APP_HOME/bin/codex-security" \

@@ -19,7 +19,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT / "workspace"
 STATE = ROOT / "runtime" / ".codex" / "automation" / "pipelines"
 TOOLCHAIN = ROOT / "bin" / "codex-toolchain"
-LANGUAGES = {"python", "node", "shell", "java", "kotlin", "android", "powershell", "static-web"}
+LANGUAGES = {
+    "python", "node", "shell", "c", "cpp", "java", "kotlin", "android",
+    "powershell", "static-web",
+}
 
 
 class PipelineError(Exception):
